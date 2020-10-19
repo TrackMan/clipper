@@ -16,6 +16,7 @@
     <Copyright>Copyright © Angus Johnson 2010-14</Copyright>
     <PackageLicenseFile>License.txt</PackageLicenseFile>
     <Product>clipper</Product>
+    <PackageProjectUrl>https://sourceforge.net/projects/polyclipping</PackageProjectUrl>
 	
   </PropertyGroup>
 

@@ -3,10 +3,10 @@ unit clipper;
 (*******************************************************************************
 *                                                                              *
 * Author    :  Angus Johnson                                                   *
-* Version   :  6.1.3                                                           *
-* Date      :  19 January 2014                                                 *
+* Version   :  6.4.2                                                           *
+* Date      :  27 February 2017                                                *
 * Website   :  http://www.angusj.com                                           *
-* Copyright :  Angus Johnson 2010-2014                                         *
+* Copyright :  Angus Johnson 2010-2017                                         *
 *                                                                              *
 * License:                                                                     *
 * Use, modification & distribution is subject to Boost Software License Ver 1. *
@@ -35,22 +35,28 @@ unit clipper;
 
 //use_int32: When enabled 32bit ints are used instead of 64bit ints. This
 //improve performance but coordinate values are limited to the range +/- 46340
-{.$DEFINE use_int32}
+//{$DEFINE use_int32}
 
 //use_xyz: adds a Z member to IntPoint (with only a minor cost to performance)
-{.$DEFINE use_xyz}
+//{$DEFINE use_xyz}
 
-//use_lines: Enables line clipping. Adds a very minor cost to performance.
-{.$DEFINE use_lines}
-
-//use_deprecated: Enables support for the obsolete OffsetPaths() function
-//which has been replace with the ClipperOffset class.
-{$DEFINE use_deprecated}
+//use_lines: Enables open path clipping (with a very minor cost to performance)
+{$DEFINE use_lines}
 
 {$IFDEF FPC}
   {$DEFINE INLINING}
   {$DEFINE UInt64Support}
 {$ELSE}
+  // enable LEGACYIFEND for Delphi XE4+
+  {$IF CompilerVersion >= 25.0}
+    {$LEGACYIFEND ON}
+  {$IFEND}
+
+  // use generic lists for NextGen compiler
+  {$IFDEF NEXTGEN}
+    {$DEFINE USEGENERICS}
+  {$ENDIF}
+
   {$IFDEF ConditionalExpressions}
     {$IF CompilerVersion >= 15} //Delphi 7
       {$DEFINE UInt64Support} //nb: Delphi7 only marginally supports UInt64.
@@ -67,10 +73,15 @@ unit clipper;
 interface
 
 uses
-  SysUtils, Types, Classes, Math;
+  SysUtils, Types, Classes,
+  {$IFDEF USEGENERICS}
+    Generics.Collections, Generics.Defaults,
+  {$ENDIF}
+  Math;
 
 const
   def_arc_tolerance = 0.25;
+
 type
 {$IFDEF use_int32}
 {$IF CompilerVersion < 20} //Delphi 2009
@@ -95,7 +106,8 @@ type
   TArrayOfDoublePoint = array of TDoublePoint;
 
 {$IFDEF use_xyz}
-  TZFillCallback = procedure (const Pt1, Pt2: TIntPoint; var Pt: TIntPoint);
+  TZFillCallback =
+    procedure (const E1Bot, E1Top, E2Bot, E2Top: TIntPoint; var Pt: TIntPoint);
 {$ENDIF}
 
   TInitOption = (ioReverseSolution, ioStrictlySimple, ioPreserveCollinear);
@@ -116,10 +128,6 @@ type
 
   TPath = array of TIntPoint;
   TPaths = array of TPath;
-
-{$IFDEF use_deprecated}
-  TEndType_ = (etClosed, etButt = 2, etSquare, etRound);
-{$ENDIF}
 
   TPolyNode = class;
   TArrayOfPolyNode = array of TPolyNode;
@@ -169,12 +177,11 @@ type
   PEdge = ^TEdge;
   TEdge = record
     Bot  : TIntPoint;      //bottom
-    Curr : TIntPoint;      //current (ie relative to bottom of current scanbeam)
+    Curr : TIntPoint;      //current (updated for every new scanbeam)
     Top  : TIntPoint;      //top
-    Delta: TIntPoint;
     Dx   : Double;         //inverse of slope
     PolyType : TPolyType;
-    Side     : TEdgeSide;
+    Side     : TEdgeSide;  //side only refers to current side of solution poly
     WindDelta: Integer;    //1 or -1 depending on winding direction
     WindCnt  : Integer;
     WindCnt2 : Integer;    //winding count of the opposite PolyType
@@ -193,8 +200,15 @@ type
 
   PScanbeam = ^TScanbeam;
   TScanbeam = record
-    Y   : cInt;
-    Next: PScanbeam;
+    Y    : cInt;
+    Next : PScanbeam;
+  end;
+
+  PMaxima = ^TMaxima;
+  TMaxima = record
+    X     : cInt;
+    Next  : PMaxima;
+    Prev  : PMaxima;
   end;
 
   PIntersectNode = ^TIntersectNode;
@@ -204,26 +218,27 @@ type
     Pt   : TIntPoint;
   end;
 
-  PLocalMinima = ^TLocalMinima;
-  TLocalMinima = record
+  PLocalMinimum = ^TLocalMinimum;
+  TLocalMinimum = record
     Y         : cInt;
     LeftBound : PEdge;
     RightBound: PEdge;
-    Next      : PLocalMinima;
   end;
 
+  //OutRec: contains a path in the clipping solution. Edges in the AEL will
+  //carry a pointer to an OutRec when they are part of the clipping solution.
   POutRec = ^TOutRec;
   TOutRec = record
     Idx         : Integer;
     BottomPt    : POutPt;
     IsHole      : Boolean;
     IsOpen      : Boolean;
-    //The 'FirstLeft' field points to the OutRec representing the polygon
-    //immediately to the left of the current OutRec's polygon. When a polygon is
-    //contained within another polygon, the polygon immediately to its left will
-    //either be its owner polygon or a sibling also contained by the same outer
-    //polygon. By storing  this field, it's easy to sort polygons into a tree
-    //structure which reflects the parent/child relationships of all polygons.
+    //The 'FirstLeft' field points to another OutRec that contains or is the
+    //'parent' of OutRec. It is 'first left' because the ActiveEdgeList (AEL) is
+    //parsed left from the current edge (owning OutRec) until the owner OutRec
+    //is found. This field simplifies sorting the polygons into a tree structure
+    //which reflects the parent/child relationships of all polygons.
+    //This field should be renamed Parent, and will be later.
     FirstLeft   : POutRec;
     Pts         : POutPt;
     PolyNode    : TPolyNode;
@@ -243,29 +258,55 @@ type
     OffPt    : TIntPoint; //offset point (provides slope of common edges)
   end;
 
+  {$IFDEF USEGENERICS}
+  TEgdeList = TList<PEdgeArray>;
+  TLocMinList = TList<PLocalMinimum>;
+  TPolyOutList = TList<POutRec>;
+  TJoinList = TList<PJoin>;
+  TIntersecList = TList<PIntersectNode>;
+  {$ELSE}
+  TEgdeList = TList;
+  TLocMinList = TList;
+  TPolyOutList = TList;
+  TJoinList = TList;
+  TIntersecList = TList;
+  {$ENDIF}
+
   TClipperBase = class
   private
-    FEdgeList         : TList;
-    FLmList           : PLocalMinima; //localMinima list
-    FCurrLm           : PLocalMinima; //current localMinima node
+    FEdgeList         : TEgdeList;
+    FPolyOutList      : TPolyOutList;
+    FScanbeam         : PScanbeam;    //scanbeam list
     FUse64BitRange    : Boolean;      //see LoRange and HiRange consts notes below
     FHasOpenPaths     : Boolean;
     procedure DisposeLocalMinimaList;
     procedure DisposePolyPts(PP: POutPt);
-    procedure InsertLocalMinima(Lm: PLocalMinima);
-    function ProcessBound(E: PEdge; IsClockwise: Boolean): PEdge;
+    function ProcessBound(E: PEdge; NextIsForward: Boolean): PEdge;
   protected
+    FLocMinList       : TLocMinList;
+    FCurrentLocMinIdx : Integer;
     FPreserveCollinear : Boolean;
+    FActiveEdges      : PEdge;        //active Edge list
     procedure Reset; virtual;
-    procedure PopLocalMinima;
-    property CurrentLm: PLocalMinima read FCurrLm;
+    procedure InsertScanbeam(const Y: cInt);
+    function PopScanbeam(out Y: cInt): Boolean;
+    function LocalMinimaPending: Boolean;
+    function PopLocalMinima(Y: cInt;
+      out LocalMinima: PLocalMinimum): Boolean;
+    procedure DisposeScanbeamList;
+    function CreateOutRec: POutRec;
+    procedure DisposeOutRec(Index: Integer);
+    procedure DisposeAllOutRecs;
+    procedure SwapPositionsInAEL(E1, E2: PEdge);
+    procedure DeleteFromAEL(E: PEdge);
+    procedure UpdateEdgeIntoAEL(var E: PEdge);
     property HasOpenPaths: Boolean read FHasOpenPaths;
   public
     constructor Create; virtual;
     destructor Destroy; override;
     procedure Clear; virtual;
 
-    function AddPath(const Path: TPath; PolyType: TPolyType; Closed: Boolean): Boolean;
+    function AddPath(const Path: TPath; PolyType: TPolyType; Closed: Boolean): Boolean; virtual;
     function AddPaths(const Paths: TPaths; PolyType: TPolyType; Closed: Boolean): Boolean;
     //PreserveCollinear: Prevents removal of 'inner' vertices when three or
     //more vertices are collinear in solution polygons.
@@ -275,14 +316,12 @@ type
 
   TClipper = class(TClipperBase)
   private
-    FPolyOutList      : TList;
-    FJoinList         : TList;
-    FGhostJoinList    : TList;
-    FIntersectList    : TList;
+    FJoinList         : TJoinList;
+    FGhostJoinList    : TJoinList;
+    FIntersectList    : TIntersecList;
+    FSortedEdges      : PEdge;        //used for temporary sorting
     FClipType         : TClipType;
-    FScanbeam         : PScanbeam; //scanbeam list
-    FActiveEdges      : PEdge;     //active Edge list
-    FSortedEdges      : PEdge;     //used for temporary sorting
+    FMaxima           : PMaxima;      //maxima XPos list
     FClipFillType     : TPolyFillType;
     FSubjFillType     : TPolyFillType;
     FExecuteLocked    : Boolean;
@@ -292,43 +331,37 @@ type
 {$IFDEF use_xyz}
     FZFillCallback    : TZFillCallback;
 {$ENDIF}
-    procedure DisposeScanbeamList;
-    procedure InsertScanbeam(const Y: cInt);
-    function PopScanbeam: cInt;
+    procedure InsertMaxima(const X: cInt);
+    procedure DisposeMaximaList;
     procedure SetWindingCount(Edge: PEdge);
     function IsEvenOddFillType(Edge: PEdge): Boolean;
     function IsEvenOddAltFillType(Edge: PEdge): Boolean;
     procedure AddEdgeToSEL(Edge: PEdge);
+    function PopEdgeFromSEL(out E: PEdge): Boolean;
     procedure CopyAELToSEL;
     procedure InsertLocalMinimaIntoAEL(const BotY: cInt);
-    procedure SwapPositionsInAEL(E1, E2: PEdge);
     procedure SwapPositionsInSEL(E1, E2: PEdge);
-    procedure ProcessHorizontal(HorzEdge: PEdge; IsTopOfScanbeam: Boolean);
-    procedure ProcessHorizontals(IsTopOfScanbeam: Boolean);
-    function ProcessIntersections(const BotY, TopY: cInt): Boolean;
-    procedure BuildIntersectList(const BotY, TopY: cInt);
+    procedure ProcessHorizontal(HorzEdge: PEdge);
+    procedure ProcessHorizontals;
+    function ProcessIntersections(const TopY: cInt): Boolean;
+    procedure BuildIntersectList(const TopY: cInt);
     procedure ProcessIntersectList;
-    procedure DeleteFromAEL(E: PEdge);
-    procedure DeleteFromSEL(E: PEdge);
-    procedure IntersectEdges(E1,E2: PEdge;
-      const Pt: TIntPoint; Protect: Boolean = False);
+    procedure IntersectEdges(E1,E2: PEdge; Pt: TIntPoint);
     procedure DoMaxima(E: PEdge);
-    procedure UpdateEdgeIntoAEL(var E: PEdge);
     function FixupIntersectionOrder: Boolean;
     procedure ProcessEdgesAtTopOfScanbeam(const TopY: cInt);
     function IsContributing(Edge: PEdge): Boolean;
-    function CreateOutRec: POutRec;
-    function AddOutPt(E: PEdge; const Pt: TIntPoint): POutPt;
+    function GetLastOutPt(E: PEdge): POutPt;
     procedure AddLocalMaxPoly(E1, E2: PEdge; const Pt: TIntPoint);
     function AddLocalMinPoly(E1, E2: PEdge; const Pt: TIntPoint): POutPt;
+    function AddOutPt(E: PEdge; const Pt: TIntPoint): POutPt;
     function GetOutRec(Idx: integer): POutRec;
     procedure AppendPolygon(E1, E2: PEdge);
-    procedure DisposeAllOutRecs;
-    procedure DisposeOutRec(Index: Integer);
     procedure DisposeIntersectNodes;
     function BuildResult: TPaths;
     function BuildResult2(PolyTree: TPolyTree): Boolean;
     procedure FixupOutPolygon(OutRec: POutRec);
+    procedure FixupOutPolyline(OutRec: POutRec);
     procedure SetHoleState(E: PEdge; OutRec: POutRec);
     procedure AddJoin(Op1, Op2: POutPt; const OffPt: TIntPoint);
     procedure ClearJoins;
@@ -336,22 +369,28 @@ type
     procedure ClearGhostJoins;
     function JoinPoints(Jr: PJoin; OutRec1, OutRec2: POutRec): Boolean;
     procedure FixupFirstLefts1(OldOutRec, NewOutRec: POutRec);
-    procedure FixupFirstLefts2(OldOutRec, NewOutRec: POutRec);
+    procedure FixupFirstLefts2(InnerOutRec, OuterOutRec: POutRec);
+    procedure FixupFirstLefts3(OldOutRec, NewOutRec: POutRec);
     procedure DoSimplePolygons;
     procedure JoinCommonEdges;
     procedure FixHoleLinkage(OutRec: POutRec);
   protected
-    procedure Reset; override;
     function ExecuteInternal: Boolean; virtual;
   public
     function Execute(clipType: TClipType;
       out solution: TPaths;
-      subjFillType: TPolyFillType = pftEvenOdd;
-      clipFillType: TPolyFillType = pftEvenOdd): Boolean; overload;
+      FillType: TPolyFillType = pftEvenOdd): Boolean; overload;
+    function Execute(clipType: TClipType;
+      out solution: TPaths;
+      subjFillType: TPolyFillType;
+      clipFillType: TPolyFillType): Boolean; overload;
     function Execute(clipType: TClipType;
       out PolyTree: TPolyTree;
-      subjFillType: TPolyFillType = pftEvenOdd;
-      clipFillType: TPolyFillType = pftEvenOdd): Boolean; overload;
+      FillType: TPolyFillType = pftEvenOdd): Boolean; overload;
+    function Execute(clipType: TClipType;
+      out PolyTree: TPolyTree;
+      subjFillType: TPolyFillType;
+      clipFillType: TPolyFillType): Boolean; overload;
     constructor Create(InitOptions: TInitOptions = []); reintroduce; overload;
     destructor Destroy; override;
     //ReverseSolution: reverses the default orientation
@@ -420,12 +459,6 @@ function DoublePoint(const Ip: TIntPoint): TDoublePoint; overload;
 function ReversePath(const Pts: TPath): TPath;
 function ReversePaths(const Pts: TPaths): TPaths;
 
-{$IFDEF use_deprecated}
-function OffsetPaths(const Polys: TPaths; const Delta: Double;
-  JoinType: TJoinType = jtSquare; EndType: TEndType_ = etClosed;
-  Limit: Double = 0): TPaths;
-{$ENDIF}
-
 //SimplifyPolygon converts a self-intersecting polygon into a simple polygon.
 function SimplifyPolygon(const Poly: TPath; FillType: TPolyFillType = pftEvenOdd): TPaths;
 function SimplifyPolygons(const Polys: TPaths; FillType: TPolyFillType = pftEvenOdd): TPaths;
@@ -443,16 +476,7 @@ function PolyTreeToPaths(PolyTree: TPolyTree): TPaths;
 function ClosedPathsFromPolyTree(PolyTree: TPolyTree): TPaths;
 function OpenPathsFromPolyTree(PolyTree: TPolyTree): TPaths;
 
-implementation
-
 const
-  Horizontal: Double = -3.4e+38;
-
-  Unassigned : Integer = -1;
-  Skip       : Integer = -2; //flag for the edge that closes an open path
-  Tolerance  : double = 1.0E-15;
-  Two_Pi     : double = 2 * PI;
-
   //The SlopesEqual function places the most limits on coordinate values
   //So, to avoid overflow errors, they must not exceed the following values...
   //Also, if all coordinates are within +/-LoRange, then calculations will be
@@ -465,6 +489,21 @@ const
   HiRange: cInt = $3FFFFFFFFFFFFFFF;  //9.2e+18
 {$ENDIF}
 
+implementation
+
+//NOTE: The Clipper library has been developed with software that uses an
+//inverted Y axis display. Therefore 'above' and 'below' in the code's comments
+//will reflect this. For example: given coord A (0,20) and coord B (0,10),
+//A.Y would be considered BELOW B.Y to correctly understand the comments.
+
+const
+  Horizontal: Double = -3.4e+38;
+
+  Unassigned : Integer = -1;
+  Skip       : Integer = -2; //flag for the edge that closes an open path
+  Tolerance  : double = 1.0E-15;
+  Two_Pi     : double = 2 * PI;
+
 resourcestring
   rsDoMaxima = 'DoMaxima error';
   rsUpdateEdgeIntoAEL = 'UpdateEdgeIntoAEL error';
@@ -473,7 +512,7 @@ resourcestring
   rsIntersect = 'Intersection error';
   rsOpenPath  = 'AddPath: Open paths must be subject.';
   rsOpenPath2  = 'AddPath: Open paths have been disabled.';
-  rsOpenPath3  = 'Error: TPolyTree struct is need for open path clipping.';
+  rsOpenPath3  = 'Error: TPolyTree struct is needed for open path clipping.';
   rsPolylines = 'Error intersecting polylines';
   rsClipperOffset = 'Error: No PolyTree assigned';
 
@@ -569,6 +608,8 @@ end;
 function TPolyTree.GetTotal: Integer;
 begin
   Result := length(FAllNodes);
+  //with negative offsets, ignore the hidden outer polygon ...
+  if (Result > 0) and (FAllNodes[0] <> FChilds[0]) then dec(Result);
 end;
 
 {$IFNDEF use_int32}
@@ -663,6 +704,18 @@ function Int128LessThan(const Int1, Int2: TInt128): Boolean;
 begin
   if (Int1.Hi <> Int2.Hi) then Result := Int1.Hi < Int2.Hi
   else Result := UInt64LT(Int1.Lo, Int2.Lo);
+end;
+//------------------------------------------------------------------------------
+
+function Int128IsNegative(const Int: TInt128): Boolean;
+begin
+  Result := Int.Hi < 0;
+end;
+//------------------------------------------------------------------------------
+
+function Int128IsPositive(const Int: TInt128): Boolean;
+begin
+  Result := (Int.Hi > 0) or ((Int.Hi = 0) and (Int.Lo <> 0));
 end;
 //------------------------------------------------------------------------------
 
@@ -836,8 +889,7 @@ begin
 end;
 //------------------------------------------------------------------------------
 
-function PointsEqual(const P1, P2: TIntPoint): Boolean;
-  {$IFDEF INLINING} inline; {$ENDIF}
+function PointsEqual(const P1, P2: TIntPoint): Boolean; {$IFDEF INLINING} inline; {$ENDIF}
 begin
   Result := (P1.X = P2.X) and (P1.Y = P2.Y);
 end;
@@ -911,20 +963,26 @@ begin
 end;
 //------------------------------------------------------------------------------
 
-function Area(OutRec: POutRec): Double; overload;
+function Area(Op: POutPt): Double; overload;
 var
-  Op: POutPt;
-  D, D2: Double;
+  op2: POutPt;
+  d2: Double;
 begin
-  D := 0;
-  Op := OutRec.Pts;
-  if Assigned(Op) then
+  Result := 0;
+  op2 := op;
+  if Assigned(op2) then
     repeat
-      D2 := Op.Prev.Pt.X + Op.Pt.X;
-      D := D + D2 * (Op.Prev.Pt.Y - Op.Pt.Y);
-      Op := Op.Next;
-    until Op = OutRec.Pts;
-  Result := D * 0.5;
+      d2 := op2.Prev.Pt.X + op2.Pt.X;
+      Result := Result + d2 * (op2.Prev.Pt.Y - op2.Pt.Y);
+      op2 := op2.Next;
+    until op2 = op;
+  Result := Result * 0.5;
+end;
+//------------------------------------------------------------------------------
+
+function Area(OutRec: POutRec): Double; overload;
+begin
+  result := Area(OutRec.Pts);
 end;
 //------------------------------------------------------------------------------
 
@@ -994,10 +1052,10 @@ var
   d, d2, d3: double; //use cInt ???
   ip, ipNext: TIntPoint;
 begin
-	//returns 0 if false, +1 if true, -1 if pt ON polygon boundary
-	//http://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.88.5498&rep=rep1&type=pdf
+  //returns 0 if false, +1 if true, -1 if pt ON polygon boundary
+  //http://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.88.5498&rep=rep1&type=pdf
   //nb: if poly bounds are known, test them first before calling this function.
-	result := 0;
+  result := 0;
   cnt := Length(poly);
   if cnt < 3 then Exit;
   ip := poly[0];
@@ -1006,100 +1064,105 @@ begin
     if i < cnt then ipNext := poly[i]
     else ipNext := poly[0];
 
-		if (ipNext.Y = pt.Y) then
-		begin
-			if (ipNext.X = pt.X) or ((ip.Y = pt.Y) and
+    if (ipNext.Y = pt.Y) then
+    begin
+      if (ipNext.X = pt.X) or ((ip.Y = pt.Y) and
         ((ipNext.X > pt.X) = (ip.X < pt.X))) then
       begin
         result := -1;
         Exit;
       end;
-		end;
+    end;
 
-		if ((ip.Y < pt.Y) <> (ipNext.Y < pt.Y)) then
-		begin
-			if (ip.X >= pt.X) then
-			begin
-				if (ipNext.X > pt.X) then
+    if ((ip.Y < pt.Y) <> (ipNext.Y < pt.Y)) then
+    begin
+      if (ip.X >= pt.X) then
+      begin
+        if (ipNext.X > pt.X) then
           result := 1 - result
-				else
-				begin
+        else
+        begin
           d2 := (ip.X - pt.X);
           d3 := (ipNext.X - pt.X);
           d := d2 * (ipNext.Y - pt.Y) - d3 * (ip.Y - pt.Y);
-					if (d = 0) then begin result := -1; Exit; end;
-					if ((d > 0) = (ipNext.Y > ip.Y)) then
+          if (d = 0) then begin result := -1; Exit; end;
+          if ((d > 0) = (ipNext.Y > ip.Y)) then
             result := 1 - result;
-				end;
-			end else
-			begin
-				if (ipNext.X > pt.X) then
-				begin
+        end;
+      end else
+      begin
+        if (ipNext.X > pt.X) then
+        begin
           d2 := (ip.X - pt.X);
           d3 := (ipNext.X - pt.X);
-					d := d2 * (ipNext.Y - pt.Y) - d3 * (ip.Y - pt.Y);
-					if (d = 0) then begin result := -1; Exit; end;
-					if ((d > 0) = (ipNext.Y > ip.Y)) then
+          d := d2 * (ipNext.Y - pt.Y) - d3 * (ip.Y - pt.Y);
+          if (d = 0) then begin result := -1; Exit; end;
+          if ((d > 0) = (ipNext.Y > ip.Y)) then
             result := 1 - result;
-				end;
-			end;
-		end;
+        end;
+      end;
+    end;
     ip := ipNext;
   end;
 end;
 //---------------------------------------------------------------------------
 
+//See "The Point in Polygon Problem for Arbitrary Polygons" by Hormann & Agathos
+//http://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.88.5498&rep=rep1&type=pdf
 function PointInPolygon (const pt: TIntPoint; ops: POutPt): Integer; overload;
 var
-  d, d2, d3: double; //Todo - use cInt and add UseFullInt64Range parameter
+  d, d2, d3: double; //nb: double not cInt avoids potential overflow errors
   opStart: POutPt;
+  pt1, ptN: TIntPoint;
 begin
-	//returns 0 if false, +1 if true, -1 if pt ON polygon boundary
-	//http://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.88.5498&rep=rep1&type=pdf
-  //nb: if poly bounds are known, test them first before calling this function.
-	result := 0;
+  //returns 0 if false, +1 if true, -1 if pt ON polygon boundary
+  result := 0;
   opStart := ops;
+  pt1.X := ops.Pt.X; pt1.Y := ops.Pt.Y;
   repeat
-		if (ops.Next.Pt.Y = pt.Y) then
-		begin
-			if (ops.Next.Pt.X = pt.X) or ((ops.Pt.Y = pt.Y) and
-        ((ops.Next.Pt.X > pt.X) = (ops.Pt.X < pt.X))) then
+    ops := ops.Next;
+    ptN.X := ops.Pt.X; ptN.Y := ops.Pt.Y;
+
+    if (ptN.Y = pt.Y) then
+    begin
+      if (ptN.X = pt.X) or ((pt1.Y = pt.Y) and
+        ((ptN.X > pt.X) = (pt1.X < pt.X))) then
       begin
         result := -1;
         Exit;
       end;
-		end;
+    end;
 
-		if ((ops.Pt.Y < pt.Y) <> (ops.Next.Pt.Y < pt.Y)) then
-		begin
-			if (ops.Pt.X >= pt.X) then
-			begin
-				if (ops.Next.Pt.X > pt.X) then
+    if ((pt1.Y < pt.Y) <> (ptN.Y < pt.Y)) then
+    begin
+      if (pt1.X >= pt.X) then
+      begin
+        if (ptN.X > pt.X) then
           result := 1 - result
-				else
-				begin
-          d2 := (ops.Pt.X - pt.X);
-          d3 := (ops.Next.Pt.X - pt.X);
-          d := d2 * (ops.Next.Pt.Y - pt.Y) - d3 * (ops.Pt.Y - pt.Y);
-					if (d = 0) then begin result := -1; Exit; end;
-					if ((d > 0) = (ops.Next.Pt.Y > ops.Pt.Y)) then
+        else
+        begin
+          d2 := (pt1.X - pt.X);
+          d3 := (ptN.X - pt.X);
+          d := d2 * (ptN.Y - pt.Y) - d3 * (pt1.Y - pt.Y);
+          if (d = 0) then begin result := -1; Exit; end;
+          if ((d > 0) = (ptN.Y > pt1.Y)) then
             result := 1 - result;
-				end;
-			end else
-			begin
-				if (ops.Next.Pt.X > pt.X) then
-				begin
-          d2 := (ops.Pt.X - pt.X);
-          d3 := (ops.Next.Pt.X - pt.X);
-					d := d2 * (ops.Next.Pt.Y - pt.Y) - d3 * (ops.Pt.Y - pt.Y);
-					if (d = 0) then begin result := -1; Exit; end;
-					if ((d > 0) = (ops.Next.Pt.Y > ops.Pt.Y)) then
+        end;
+      end else
+      begin
+        if (ptN.X > pt.X) then
+        begin
+          d2 := (pt1.X - pt.X);
+          d3 := (ptN.X - pt.X);
+          d := d2 * (ptN.Y - pt.Y) - d3 * (pt1.Y - pt.Y);
+          if (d = 0) then begin result := -1; Exit; end;
+          if ((d > 0) = (ptN.Y > pt1.Y)) then
             result := 1 - result;
-				end;
-			end;
-		end;
-    ops := ops.Next;
-	until ops = opStart;
+        end;
+      end;
+    end;
+    pt1 := ptN;
+  until ops = opStart;
 end;
 //---------------------------------------------------------------------------
 
@@ -1110,10 +1173,11 @@ var
 begin
   op := OutPt1;
   repeat
+    //nb: PointInPolygon returns 0 if false, +1 if true, -1 if pt on polygon
     res := PointInPolygon(op.Pt, OutPt2);
     if (res >= 0) then
     begin
-      Result := res <> 0;
+      Result := res > 0;
       Exit;
     end;
     op := op.Next;
@@ -1127,11 +1191,12 @@ function SlopesEqual(E1, E2: PEdge;
 begin
 {$IFNDEF use_int32}
   if UseFullInt64Range then
-    Result := Int128Equal(Int128Mul(E1.Delta.Y, E2.Delta.X),
-      Int128Mul(E1.Delta.X, E2.Delta.Y))
+    Result := Int128Equal(Int128Mul(E1.Top.Y-E1.Bot.Y, E2.Top.X-E2.Bot.X),
+      Int128Mul(E1.Top.X-E1.Bot.X, E2.Top.Y-E2.Bot.Y))
   else
 {$ENDIF}
-    Result := E1.Delta.Y * E2.Delta.X = E1.Delta.X * E2.Delta.Y;
+    Result := (E1.Top.Y-E1.Bot.Y) * (E2.Top.X-E2.Bot.X) =
+      (E1.Top.X-E1.Bot.X) * (E2.Top.Y-E2.Bot.Y);
 end;
 //---------------------------------------------------------------------------
 
@@ -1148,6 +1213,19 @@ begin
 end;
 //---------------------------------------------------------------------------
 
+function SlopesEqual(const L1a, L1b, L2a, L2b: TIntPoint;
+  UseFullInt64Range: Boolean): Boolean; overload;
+begin
+{$IFNDEF use_int32}
+  if UseFullInt64Range then
+    Result := Int128Equal(
+      Int128Mul(L1a.Y-L1b.Y, L2a.X-L2b.X), Int128Mul(L2a.Y-L2b.Y, L1a.X-L1b.X))
+  else
+{$ENDIF}
+  //dy1 * dx2 = dy2 * dx1
+  Result := (L1a.Y-L1b.Y)*(L2a.X-L2b.X) = (L2a.Y-L2b.Y)*(L1a.X-L1b.X);
+end;
+
 (*****************************************************************************
 *  Dx:                  0(90º)                       Slope:   0  = Dx: -inf  *
 *                       |                            Slope: 0.5  = Dx:   -2  *
@@ -1163,15 +1241,32 @@ end;
 //---------------------------------------------------------------------------
 
 procedure SetDx(E: PEdge); {$IFDEF INLINING} inline; {$ENDIF}
+var
+  dy: cInt;
 begin
-  E.Delta.X := (E.Top.X - E.Bot.X);
-  E.Delta.Y := (E.Top.Y - E.Bot.Y);
-  if E.Delta.Y = 0 then E.Dx := Horizontal
-  else E.Dx := E.Delta.X/E.Delta.Y;
+  dy := (E.Top.Y - E.Bot.Y);
+  if dy = 0 then E.Dx := Horizontal
+  else E.Dx := (E.Top.X - E.Bot.X)/dy;
 end;
 //---------------------------------------------------------------------------
 
-procedure SwapSides(Edge1, Edge2: PEdge);
+function IsHorizontal(E: PEdge): Boolean; {$IFDEF INLINING} inline; {$ENDIF}
+begin
+  Result := E.Dx = Horizontal;
+end;
+//------------------------------------------------------------------------------
+
+procedure Swap(var val1, val2: cInt); {$IFDEF INLINING} inline; {$ENDIF}
+var
+  tmp: cInt;
+begin
+  tmp := val1;
+  val1 := val2;
+  val2 := tmp;
+end;
+//---------------------------------------------------------------------------
+
+procedure SwapSides(Edge1, Edge2: PEdge); {$IFDEF INLINING} inline; {$ENDIF}
 var
   Side: TEdgeSide;
 begin
@@ -1182,6 +1277,7 @@ end;
 //------------------------------------------------------------------------------
 
 procedure SwapPolyIndexes(Edge1, Edge2: PEdge);
+{$IFDEF INLINING} inline; {$ENDIF}
 var
   OutIdx: Integer;
 begin
@@ -1191,52 +1287,58 @@ begin
 end;
 //------------------------------------------------------------------------------
 
+function NextIsHorz(Edge: PEdge): Boolean;
+{$IFDEF INLINING} inline; {$ENDIF}
+begin
+  Result := assigned(Edge.NextInLML) and (Edge.NextInLML.Dx = Horizontal);
+end;
+//------------------------------------------------------------------------------
+
+function NextIsHorzAt(Edge: PEdge; Y: cInt): Boolean;
+{$IFDEF INLINING} inline; {$ENDIF}
+begin
+  Result := (Edge.Top.Y = Y) and assigned(Edge.NextInLML) and
+    (Edge.NextInLML.Dx = Horizontal);
+end;
+//------------------------------------------------------------------------------
+
 function TopX(Edge: PEdge; const currentY: cInt): cInt;
+{$IFDEF INLINING} inline; {$ENDIF}
 begin
   if currentY = Edge.Top.Y then Result := Edge.Top.X
   else if Edge.Top.X = Edge.Bot.X then Result := Edge.Bot.X
-  else Result := Edge.Bot.X + round(Edge.Dx*(currentY - Edge.Bot.Y));
+  else Result := Edge.Bot.X + Round(Edge.Dx*(currentY - Edge.Bot.Y));
 end;
 //------------------------------------------------------------------------------
 
 {$IFDEF use_xyz}
-Procedure SetZ(var Pt: TIntPoint; E: PEdge; ZFillFunc: TZFillCallback);
+Procedure SetZ(var Pt: TIntPoint; E1, E2: PEdge; ZFillFunc: TZFillCallback);
 begin
-  Pt.Z := 0;
-  if assigned(ZFillFunc) then
-  begin
-    //put the 'preferred' point as first parameter ...
-    if E.OutIdx < 0 then
-      ZFillFunc(E.Bot, E.Top, Pt) //outside a path so presume entering ...
-    else
-      ZFillFunc(E.Top, E.Bot, Pt); //inside a path so presume exiting ...
-  end;
+  if (Pt.Z <> 0) or not assigned(ZFillFunc) then Exit
+  else if PointsEqual(Pt, E1.Bot) then Pt.Z := E1.Bot.Z
+  else if PointsEqual(Pt, E2.Bot) then Pt.Z := E2.Bot.Z
+  else if PointsEqual(Pt, E1.Top) then Pt.Z := E1.Top.Z
+  else if PointsEqual(Pt, E2.Top) then Pt.Z := E2.Top.Z
+  else ZFillFunc(E1.Bot, E1.Top, E2.Bot, E2.Top, Pt);
 end;
 //------------------------------------------------------------------------------
 {$ENDIF}
 
-function IntersectPoint(Edge1, Edge2: PEdge;
-  out ip: TIntPoint; UseFullInt64Range: Boolean): Boolean; overload;
+procedure IntersectPointEx(Edge1, Edge2: PEdge; out ip: TIntPoint);
 var
   B1,B2,M: Double;
 begin
 {$IFDEF use_xyz}
   ip.Z := 0;
 {$ENDIF}
-  //nb: with very large coordinate values, it's possible for SlopesEqual() to
-  //return false but for the edge.Dx value be equal due to double precision
-  //rounding ...
-  if SlopesEqual(Edge1, Edge2, UseFullInt64Range) or (edge1.Dx = edge2.Dx) then
+  if (edge1.Dx = edge2.Dx) then
   begin
-    //parallel edges, but nevertheless prepare to force the intersection
-    //since Edge2.Curr.X < Edge1.Curr.X ...
-    if Edge2.Bot.Y > Edge1.Bot.Y then
-      ip := Edge2.Bot else
-      ip := Edge1.Bot;
-    Result := False;
+    ip.Y := edge1.Curr.Y;
+    ip.X := TopX(edge1, ip.Y);
     Exit;
   end;
-  if Edge1.Delta.X = 0 then
+
+  if Edge1.Dx = 0 then
   begin
     ip.X := Edge1.Bot.X;
     if Edge2.Dx = Horizontal then
@@ -1247,7 +1349,7 @@ begin
       ip.Y := round(ip.X/Edge2.Dx + B2);
     end;
   end
-  else if Edge2.Delta.X = 0 then
+  else if Edge2.Dx = 0 then
   begin
     ip.X := Edge2.Bot.X;
     if Edge1.Dx = Horizontal then
@@ -1287,7 +1389,14 @@ begin
       ip.X := TopX(Edge1, ip.Y) else
       ip.X := TopX(Edge2, ip.Y);
   end;
-  Result := True;
+  //finally, don't allow 'ip' to be BELOW curr.Y (ie bottom of scanbeam) ...
+  if (ip.Y > Edge1.Curr.Y) then
+  begin
+    ip.Y := Edge1.Curr.Y;
+    if (abs(Edge1.Dx) > abs(Edge2.Dx)) then //ie use more vertical edge
+      ip.X := TopX(Edge2, ip.Y) else
+      ip.X := TopX(Edge1, ip.Y);
+  end;
 end;
 //------------------------------------------------------------------------------
 
@@ -1363,20 +1472,13 @@ end;
 //------------------------------------------------------------------------------
 
 procedure ReverseHorizontal(E: PEdge);
-var
-  tmp: cInt;
 begin
   //swap horizontal edges' top and bottom x's so they follow the natural
   //progression of the bounds - ie so their xbots will align with the
   //adjoining lower Edge. [Helpful in the ProcessHorizontal() method.]
-  tmp := E.Top.X;
-  E.Top.X := E.Bot.X;
-  E.Bot.X := tmp;
-
+  Swap(E.Top.X, E.Bot.X);
 {$IFDEF use_xyz}
-  tmp := E.Top.Z;
-  E.Top.Z := E.Bot.Z;
-  E.Bot.Z := tmp;
+  Swap(E.Top.Z, E.Bot.Z);
 {$ENDIF}
 end;
 //------------------------------------------------------------------------------
@@ -1387,11 +1489,12 @@ begin
   E.Curr := Pt;
   E.Next := Next;
   E.Prev := Prev;
-  E.OutIdx := -1;
+  E.OutIdx := Unassigned;
 end;
 //------------------------------------------------------------------------------
 
-procedure InitEdge2(E: PEdge; PolyType: TPolyType); {$IFDEF INLINING} inline; {$ENDIF}
+procedure InitEdge2(E: PEdge; PolyType: TPolyType);
+{$IFDEF INLINING} inline; {$ENDIF}
 begin
   if E.Curr.Y >= E.Next.Curr.Y then
   begin
@@ -1427,13 +1530,36 @@ begin
       PointsEqual(E.Curr, E.Top) do E := E.Next;
     if (E.Dx <> Horizontal) and (E.Prev.Dx <> Horizontal) then break;
     while (E.Prev.Dx = Horizontal) do E := E.Prev;
-    E2 := E;
+    E2 := E; //E2 == first horizontal
     while (E.Dx = Horizontal) do E := E.Next;
     if (E.Top.Y = E.Prev.Bot.Y) then Continue; //ie just an intermediate horz.
+    //E == first edge past horizontals
     if E2.Prev.Bot.X < E.Bot.X then E := E2;
+    //E is first horizontal when CW and first past horizontals when CCW
     break;
   end;
   Result := E;
+end;
+//------------------------------------------------------------------------------
+
+function GetUnitNormal(const Pt1, Pt2: TIntPoint): TDoublePoint;
+var
+  Dx, Dy, F: Double;
+begin
+  if (Pt2.X = Pt1.X) and (Pt2.Y = Pt1.Y) then
+  begin
+    Result.X := 0;
+    Result.Y := 0;
+    Exit;
+  end;
+
+  Dx := (Pt2.X - Pt1.X);
+  Dy := (Pt2.Y - Pt1.Y);
+  F := 1 / Hypot(Dx, Dy);
+  Dx := Dx * F;
+  Dy := Dy * F;
+  Result.X := Dy;
+  Result.Y := -Dx
 end;
 
 //------------------------------------------------------------------------------
@@ -1442,9 +1568,11 @@ end;
 
 constructor TClipperBase.Create;
 begin
-  FEdgeList := TList.Create;
-  FLmList := nil;
-  FCurrLm := nil;
+  inherited;
+  FEdgeList := TEgdeList.Create;
+  FLocMinList := TLocMinList.Create;
+  FPolyOutList := TPolyOutList.Create;
+  FCurrentLocMinIdx := 0;
   FUse64BitRange := False; //ie default is False
 end;
 //------------------------------------------------------------------------------
@@ -1452,53 +1580,73 @@ end;
 destructor TClipperBase.Destroy;
 begin
   Clear;
+  DisposeScanbeamList;
+  FPolyOutList.Free;
   FEdgeList.Free;
+  FLocMinList.Free;
   inherited;
 end;
 //------------------------------------------------------------------------------
 
-procedure TClipperBase.InsertLocalMinima(Lm: PLocalMinima);
-var
-  TmpLm: PLocalMinima;
-begin
-  if not Assigned(FLmList) then
-  begin
-    FLmList := Lm;
-  end
-  else if (Lm.Y >= FLmList.Y) then
-  begin
-    Lm.Next := FLmList;
-    FLmList := Lm;
-  end else
-  begin
-    TmpLm := FLmList;
-    while Assigned(TmpLm.Next) and (Lm.Y < TmpLm.Next.Y) do
-        TmpLm := TmpLm.Next;
-    Lm.Next := TmpLm.Next;
-    TmpLm.Next := Lm;
-  end;
-end;
-//----------------------------------------------------------------------
-
-function TClipperBase.ProcessBound(E: PEdge; IsClockwise: Boolean): PEdge;
+function TClipperBase.ProcessBound(E: PEdge; NextIsForward: Boolean): PEdge;
 var
   EStart, Horz: PEdge;
-  locMin: PLocalMinima;
-  StartX: cInt;
+  locMin: PLocalMinimum;
 begin
-  EStart := E;
   Result := E;
+  if (E.OutIdx = Skip) then
+  begin
+    //check if there are edges beyond the skip edge in the bound and if so
+    //create another LocMin and calling ProcessBound once more ...
+    if NextIsForward then
+    begin
+      while (E.Top.Y = E.Next.Bot.Y) do
+        E := E.Next;
+      //don't include top horizontals here ...
+      while (E <> Result) and (E.Dx = Horizontal) do E := E.Prev;
+    end else
+    begin
+      while (E.Top.Y = E.Prev.Bot.Y) do E := E.Prev;
+      while (E <> Result) and (E.Dx = Horizontal) do E := E.Next;
+    end;
+    if E = Result then
+    begin
+      if NextIsForward then Result := E.Next
+      else Result := E.Prev;
+    end else
+    begin
+      if NextIsForward then
+        E := Result.Next else
+        E := Result.Prev;
+      new(locMin);
+      locMin.Y := E.Bot.Y;
+      locMin.LeftBound := nil;
+      locMin.RightBound := E;
+      E.WindDelta := 0;
+      Result := ProcessBound(E, NextIsForward);
+      FLocMinList.Add(locMin);
+    end;
+    Exit;
+  end;
+
   if (E.Dx = Horizontal) then
   begin
-    //it's possible for adjacent overlapping horz edges to start heading left
-    //before finishing right, so ...
-    if IsClockwise then StartX := E.Prev.Bot.X
-    else StartX := E.Next.Bot.X;
-    if (E.Bot.X <> StartX) then ReverseHorizontal(E);
+    //We need to be careful with open paths because this may not be a
+    //true local minima (ie E may be following a skip edge).
+    //Also, consecutive horz. edges may start heading left before going right.
+    if NextIsForward then EStart := E.Prev
+    else EStart := E.Next;
+    if (EStart.Dx = Horizontal) then //ie an adjoining horizontal skip edge
+    begin
+      if (EStart.Bot.X <> E.Bot.X) and (EStart.Top.X <> E.Bot.X) then
+        ReverseHorizontal(E);
+    end
+    else if (EStart.Bot.X <> E.Bot.X) then
+        ReverseHorizontal(E);
   end;
-  if Result.OutIdx = Skip then
-    //do nothing here
-  else if IsClockwise then
+
+  EStart := E;
+  if NextIsForward then
   begin
     while (Result.Top.Y = Result.Next.Bot.Y) and (Result.Next.OutIdx <> Skip) do
       Result := Result.Next;
@@ -1509,11 +1657,7 @@ begin
       //unless a Skip edge is encountered when that becomes the top divide
       Horz := Result;
       while (Horz.Prev.Dx = Horizontal) do Horz := Horz.Prev;
-      if (Horz.Prev.Top.X = Result.Next.Top.X) then
-      begin
-        if not IsClockwise then Result := Horz.Prev;
-      end
-      else if (Horz.Prev.Top.X > Result.Next.Top.X) then Result := Horz.Prev;
+      if (Horz.Prev.Top.X > Result.Next.Top.X) then Result := Horz.Prev;
     end;
     while (E <> Result) do
     begin
@@ -1533,11 +1677,8 @@ begin
     begin
       Horz := Result;
       while (Horz.Next.Dx = Horizontal) do Horz := Horz.Next;
-      if (Horz.Next.Top.X = Result.Prev.Top.X) then
-      begin
-        if not IsClockwise then Result := Horz.Next;
-      end
-      else if (Horz.Next.Top.X > Result.Prev.Top.X) then Result := Horz.Next;
+      if (Horz.Next.Top.X = Result.Prev.Top.X) or
+        (Horz.Next.Top.X > Result.Prev.Top.X) then Result := Horz.Next;
     end;
     while (E <> Result) do
     begin
@@ -1550,42 +1691,6 @@ begin
       ReverseHorizontal(E);
     Result := Result.Prev; //move to the edge just beyond current bound
   end;
-  if (Result.OutIdx = Skip) then
-  begin
-    //if edges still remain in the current bound beyond the skip edge then
-    //create another LocMin and call ProcessBound once more
-    E := Result;
-    if IsClockwise then
-    begin
-      while (E.Top.Y = E.Next.Bot.Y) do E := E.Next;
-      //don't include top horizontals when parsing a bound a second time,
-      //they will be contained in the opposite bound ...
-      while (E <> Result) and (E.Dx = Horizontal) do E := E.Prev;
-    end else
-    begin
-      while (E.Top.Y = E.Prev.Bot.Y) do E := E.Prev;
-      while (E <> Result) and (E.Dx = Horizontal) do E := E.Next;
-    end;
-    if E = Result then
-    begin
-      if IsClockwise then Result := E.Next
-      else Result := E.Prev;
-    end else
-    begin
-      //there are more edges in the bound beyond result starting with E
-      if IsClockwise then
-        E := Result.Next else
-        E := Result.Prev;
-      new(locMin);
-      locMin.Next := nil;
-      locMin.Y := E.Bot.Y;
-      locMin.LeftBound := nil;
-      locMin.RightBound := E;
-      locMin.RightBound.WindDelta := 0;
-      Result := ProcessBound(locMin.RightBound, isClockwise);
-      InsertLocalMinima(locMin);
-    end;
-  end;
 end;
 //------------------------------------------------------------------------------
 
@@ -1595,8 +1700,8 @@ var
   I, HighI: Integer;
   Edges: PEdgeArray;
   E, E2, EMin, EStart, ELoopStop: PEdge;
-  IsFlat, clockwise: Boolean;
-  locMin: PLocalMinima;
+  IsFlat, leftBoundIsForward: Boolean;
+  locMin: PLocalMinimum;
 begin
 {$IFDEF use_lines}
   if not Closed and (polyType = ptClip) then
@@ -1639,9 +1744,10 @@ begin
   ELoopStop := EStart;
   while (E <> E.Next) do //ie in case loop reduces to a single vertex
   begin
-    if PointsEqual(E.Curr, E.Next.Curr) then
+    //allow matching start and end points when not Closed ...
+    if PointsEqual(E.Curr, E.Next.Curr) and
+      (Closed or (E.Next <> EStart)) then
     begin
-      //nb E.OutIdx never equals Skip here because it would then be SemiClosed
       if E = EStart then EStart := E.Next;
       E := RemoveEdge(E);
       ELoopStop := E;
@@ -1665,6 +1771,8 @@ begin
       Continue;
     end;
     E := E.Next;
+    //todo - manage open paths which start and end at same point
+    if (E = eLoopStop) then Break;
     if E = ELoopStop then Break;
   end;
 
@@ -1685,7 +1793,7 @@ begin
   repeat
     InitEdge2(E, polyType);
     E := E.Next;
-	  if IsFlat and (E.Curr.Y <> EStart.Curr.Y) then IsFlat := false;
+    if IsFlat and (E.Curr.Y <> EStart.Curr.Y) then IsFlat := false;
   until E = EStart;
   //4. Finally, add edge bounds to LocalMinima list ...
 
@@ -1698,21 +1806,20 @@ begin
       FreeMem(Edges);
       Exit;
     end;
-    if E.Prev.Bot.X < E.Prev.Top.X then ReverseHorizontal(E.Prev);
     new(locMin);
-    locMin.Next := nil;
     locMin.Y := E.Bot.Y;
     locMin.LeftBound := nil;
     locMin.RightBound := E;
     locMin.RightBound.Side := esRight;
     locMin.RightBound.WindDelta := 0;
-    while E.Next.OutIdx <> Skip do
+    while true do
     begin
-      E.NextInLML := E.Next;
       if E.Bot.X <> E.Prev.Top.X then ReverseHorizontal(E);
+      if E.Next.OutIdx = Skip then break;
+      E.NextInLML := E.Next;
       E := E.Next;
     end;
-    InsertLocalMinima(locMin);
+    FLocMinList.Add(locMin);
     Result := true;
     FEdgeList.Add(Edges);
     Exit;
@@ -1721,6 +1828,11 @@ begin
   Result := true;
   FEdgeList.Add(Edges);
   EMin := nil;
+
+  //workaround to avoid an endless loop in the while loop below when
+  //open paths have matching start and end points ...
+  if PointsEqual(E.Prev.Bot, E.Prev.Top) then E := E.Next;
+
   while true do
   begin
     E := FindNextLocMin(E);
@@ -1730,21 +1842,18 @@ begin
     //E and E.Prev now share a local minima (left aligned if horizontal).
     //Compare their slopes to find which starts which bound ...
     new(locMin);
-    locMin.Next := nil;
     locMin.Y := E.Bot.Y;
     if (E.Dx < E.Prev.Dx) then
     begin
       locMin.LeftBound := E.Prev;
-      locMin.RightBound := E;
-      clockwise := false; //Q.nextInLML = Q.prev
+      locMin.RightBound := E; //can be horz when CW
+      leftBoundIsForward := false; //Q.nextInLML = Q.prev
     end else
     begin
       locMin.LeftBound := E;
-      locMin.RightBound := E.Prev;
-      clockwise := true; //Q.nextInLML = Q.next
+      locMin.RightBound := E.Prev; //can be horz when CCW
+      leftBoundIsForward := true; //Q.nextInLML = Q.next
     end;
-    locMin.LeftBound.Side := esLeft;
-    locMin.RightBound.Side := esRight;
 
     if not Closed then locMin.LeftBound.WindDelta := 0
     else if (locMin.LeftBound.Next = locMin.RightBound) then
@@ -1752,15 +1861,17 @@ begin
     else locMin.LeftBound.WindDelta := 1;
     locMin.RightBound.WindDelta := -locMin.LeftBound.WindDelta;
 
-    E := ProcessBound(locMin.LeftBound, clockwise);
-    E2 := ProcessBound(locMin.RightBound, not clockwise);
+    E := ProcessBound(locMin.LeftBound, leftBoundIsForward);
+    if E.OutIdx = Skip then E := ProcessBound(E, leftBoundIsForward);
 
-    if (locMin.LeftBound.OutIdx = Skip) then
-      locMin.LeftBound := nil
-    else if (locMin.RightBound.OutIdx = Skip) then
-      locMin.RightBound := nil;
-    InsertLocalMinima(locMin);
-    if not clockwise then E := E2;
+    E2 := ProcessBound(locMin.RightBound, not leftBoundIsForward);
+    if E2.OutIdx = Skip then E2 := ProcessBound(E2, not leftBoundIsForward);
+
+    if (locMin.LeftBound.OutIdx = Skip) then locMin.LeftBound := nil
+    else if (locMin.RightBound.OutIdx = Skip) then locMin.RightBound := nil;
+    FLocMinList.Add(locMin);
+
+    if not leftBoundIsForward then E := E2;
   end;
 end;
 //------------------------------------------------------------------------------
@@ -1791,33 +1902,137 @@ begin
 end;
 //------------------------------------------------------------------------------
 
+procedure TClipperBase.InsertScanbeam(const Y: cInt);
+var
+  newSb, sb: PScanbeam;
+begin
+  //single-linked list: sorted descending, ignoring dups.
+  new(newSb);
+  newSb.Y := Y;
+  if not Assigned(fScanbeam) then
+  begin
+    FScanbeam := newSb;
+    newSb.Next := nil;
+  end else if Y > FScanbeam.Y then
+  begin
+    newSb.Next := FScanbeam;
+    FScanbeam := newSb;
+  end else
+  begin
+    sb := FScanbeam;
+    while Assigned(sb.Next) and (Y <= sb.Next.Y) do sb := sb.Next;
+    if Y <> sb.Y then
+    begin
+      newSb.Next := sb.Next;
+      sb.Next := newSb;
+    end
+    else dispose(newSb);
+  end;
+end;
+//------------------------------------------------------------------------------
+
+function TClipperBase.PopScanbeam(out Y: cInt): Boolean;
+var
+  Sb: PScanbeam;
+begin
+  Result := assigned(FScanbeam);
+  if not result then exit;
+  Y := FScanbeam.Y;
+  Sb := FScanbeam;
+  FScanbeam := FScanbeam.Next;
+  dispose(Sb);
+end;
+//------------------------------------------------------------------------------
+
+function TClipperBase.LocalMinimaPending: Boolean;
+begin
+  Result := FCurrentLocMinIdx < FLocMinList.Count;
+end;
+//------------------------------------------------------------------------------
+
+function TClipperBase.PopLocalMinima(Y: cInt;
+  out LocalMinima: PLocalMinimum): Boolean;
+begin
+  Result := false;
+  if (FCurrentLocMinIdx = FLocMinList.Count) then Exit;
+  LocalMinima := PLocalMinimum(FLocMinList[FCurrentLocMinIdx]);
+  if (LocalMinima.Y = Y) then
+  begin
+    inc(FCurrentLocMinIdx);
+    Result := true;
+  end;
+end;
+//------------------------------------------------------------------------------
+
+procedure TClipperBase.DisposeScanbeamList;
+var
+  SB: PScanbeam;
+begin
+  while Assigned(fScanbeam) do
+  begin
+    SB := FScanbeam.Next;
+    Dispose(fScanbeam);
+    FScanbeam := SB;
+  end;
+end;
+//------------------------------------------------------------------------------
+
+{$IFNDEF USEGENERICS}
+function LocMinListSort(item1, item2:Pointer): Integer;
+var
+  y: cInt;
+begin
+  y := PLocalMinimum(item2).Y - PLocalMinimum(item1).Y;
+  if y < 0 then result := -1
+  else if y > 0 then result := 1
+  else result := 0;
+end;
+{$ENDIF}
+
+//------------------------------------------------------------------------------
+
 procedure TClipperBase.Reset;
 var
-  Lm: PLocalMinima;
+  i: Integer;
+  Lm: PLocalMinimum;
 begin
   //Reset() allows various clipping operations to be executed
   //multiple times on the same polygon sets.
-  FCurrLm := FLmList;
-  Lm := FCurrLm;
-  while Assigned(Lm) do
+{$IFDEF USEGENERICS}
+    FLocMinList.Sort(TComparer<PLocalMinimum>.Construct(
+      function (const Item1, Item2 : PLocalMinimum) : integer
+      var
+        y: cInt;
+      begin
+        y := PLocalMinimum(item2).Y - PLocalMinimum(item1).Y;
+        if y < 0 then result := -1
+        else if y > 0 then result := 1
+        else result := 0;
+      end
+    ));
+{$ELSE}
+  FLocMinList.Sort(LocMinListSort);
+{$ENDIF}
+  for i := 0 to FLocMinList.Count -1 do
   begin
+    Lm := PLocalMinimum(FLocMinList[i]);
+    InsertScanbeam(Lm.Y);
     //resets just the two (L & R) edges attached to each Local Minima ...
     if assigned(Lm.LeftBound) then
       with Lm.LeftBound^ do
       begin
         Curr := Bot;
-        Side := esLeft;
         OutIdx := Unassigned;
       end;
     if assigned(Lm.RightBound) then
       with Lm.RightBound^ do
       begin
         Curr := Bot;
-        Side := esRight;
         OutIdx := Unassigned;
       end;
-    Lm := Lm.Next;
   end;
+  FCurrentLocMinIdx := 0;
+  FActiveEdges := nil;
 end;
 //------------------------------------------------------------------------------
 
@@ -1836,21 +2051,139 @@ end;
 //------------------------------------------------------------------------------
 
 procedure TClipperBase.DisposeLocalMinimaList;
+var
+  i: Integer;
 begin
-  while Assigned(FLmList) do
-  begin
-    FCurrLm := FLmList.Next;
-    Dispose(FLmList);
-    FLmList := FCurrLm;
-  end;
-  FCurrLm := nil;
+  for i := 0 to FLocMinList.Count -1 do
+    Dispose(PLocalMinimum(FLocMinList[i]));
+  FLocMinList.Clear;
+  FCurrentLocMinIdx := 0;
 end;
 //------------------------------------------------------------------------------
 
-procedure TClipperBase.PopLocalMinima;
+function TClipperBase.CreateOutRec: POutRec;
 begin
-  if not Assigned(fCurrLM) then Exit;
-  FCurrLM := FCurrLM.Next;
+  new(Result);
+  Result.IsHole := False;
+  Result.IsOpen := False;
+  Result.FirstLeft := nil;
+  Result.Pts := nil;
+  Result.BottomPt := nil;
+  Result.PolyNode := nil;
+  Result.Idx := FPolyOutList.Add(Result);
+end;
+//------------------------------------------------------------------------------
+
+procedure TClipperBase.DisposeOutRec(Index: Integer);
+var
+  OutRec: POutRec;
+begin
+  OutRec := FPolyOutList[Index];
+  if Assigned(OutRec.Pts) then DisposePolyPts(OutRec.Pts);
+  Dispose(OutRec);
+  FPolyOutList[Index] := nil;
+end;
+//------------------------------------------------------------------------------
+
+procedure TClipperBase.DisposeAllOutRecs;
+var
+  I: Integer;
+begin
+  for I := 0 to FPolyOutList.Count -1 do DisposeOutRec(I);
+  FPolyOutList.Clear;
+end;
+//------------------------------------------------------------------------------
+
+procedure TClipperBase.UpdateEdgeIntoAEL(var E: PEdge);
+var
+  AelPrev, AelNext: PEdge;
+begin
+  //return true when AddOutPt() call needed too
+  if not Assigned(E.NextInLML) then
+    raise exception.Create(rsUpdateEdgeIntoAEL);
+
+  E.NextInLML.OutIdx := E.OutIdx;
+
+  AelPrev := E.PrevInAEL;
+  AelNext := E.NextInAEL;
+  if Assigned(AelPrev) then
+    AelPrev.NextInAEL := E.NextInLML else
+    FActiveEdges := E.NextInLML;
+  if Assigned(AelNext) then
+    AelNext.PrevInAEL := E.NextInLML;
+  E.NextInLML.Side := E.Side;
+  E.NextInLML.WindDelta := E.WindDelta;
+  E.NextInLML.WindCnt := E.WindCnt;
+  E.NextInLML.WindCnt2 := E.WindCnt2;
+  E := E.NextInLML; ////
+  E.Curr := E.Bot;
+  E.PrevInAEL := AelPrev;
+  E.NextInAEL := AelNext;
+  if E.Dx <> Horizontal then
+    InsertScanbeam(E.Top.Y);
+end;
+//------------------------------------------------------------------------------
+
+procedure TClipperBase.SwapPositionsInAEL(E1, E2: PEdge);
+var
+  Prev,Next: PEdge;
+begin
+  //check that one or other edge hasn't already been removed from AEL ...
+  if (E1.NextInAEL = E1.PrevInAEL) or (E2.NextInAEL = E2.PrevInAEL) then
+    Exit;
+
+  if E1.NextInAEL = E2 then
+  begin
+    Next := E2.NextInAEL;
+    if Assigned(Next) then Next.PrevInAEL := E1;
+    Prev := E1.PrevInAEL;
+    if Assigned(Prev) then Prev.NextInAEL := E2;
+    E2.PrevInAEL := Prev;
+    E2.NextInAEL := E1;
+    E1.PrevInAEL := E2;
+    E1.NextInAEL := Next;
+  end
+  else if E2.NextInAEL = E1 then
+  begin
+    Next := E1.NextInAEL;
+    if Assigned(Next) then Next.PrevInAEL := E2;
+    Prev := E2.PrevInAEL;
+    if Assigned(Prev) then Prev.NextInAEL := E1;
+    E1.PrevInAEL := Prev;
+    E1.NextInAEL := E2;
+    E2.PrevInAEL := E1;
+    E2.NextInAEL := Next;
+  end else
+  begin
+    Next := E1.NextInAEL;
+    Prev := E1.PrevInAEL;
+    E1.NextInAEL := E2.NextInAEL;
+    if Assigned(E1.NextInAEL) then E1.NextInAEL.PrevInAEL := E1;
+    E1.PrevInAEL := E2.PrevInAEL;
+    if Assigned(E1.PrevInAEL) then E1.PrevInAEL.NextInAEL := E1;
+    E2.NextInAEL := Next;
+    if Assigned(E2.NextInAEL) then E2.NextInAEL.PrevInAEL := E2;
+    E2.PrevInAEL := Prev;
+    if Assigned(E2.PrevInAEL) then E2.PrevInAEL.NextInAEL := E2;
+  end;
+  if not Assigned(E1.PrevInAEL) then FActiveEdges := E1
+  else if not Assigned(E2.PrevInAEL) then FActiveEdges := E2;
+end;
+//------------------------------------------------------------------------------
+
+procedure TClipperBase.DeleteFromAEL(E: PEdge);
+var
+  AelPrev, AelNext: PEdge;
+begin
+  AelPrev := E.PrevInAEL;
+  AelNext := E.NextInAEL;
+  if not Assigned(AelPrev) and not Assigned(AelNext) and
+    (E <> FActiveEdges) then Exit; //already deleted
+  if Assigned(AelPrev) then AelPrev.NextInAEL := AelNext
+  else FActiveEdges := AelNext;
+  if Assigned(AelNext) then AelNext.PrevInAEL := AelPrev;
+  E.NextInAEL := nil;
+  E.PrevInAEL := nil;
 end;
 
 //------------------------------------------------------------------------------
@@ -1860,10 +2193,9 @@ end;
 constructor TClipper.Create(InitOptions: TInitOptions = []);
 begin
   inherited Create;
-  FJoinList := TList.Create;
-  FGhostJoinList := TList.Create;
-  FPolyOutList := TList.Create;
-  FIntersectList := TList.Create;
+  FJoinList := TJoinList.Create;
+  FGhostJoinList := TJoinList.Create;
+  FIntersectList := TIntersecList.Create;
   if ioReverseSolution in InitOptions then
     FReverseOutput := true;
   if ioStrictlySimple in InitOptions then
@@ -1876,46 +2208,23 @@ end;
 destructor TClipper.Destroy;
 begin
   inherited; //this must be first since inherited Destroy calls Clear.
-  DisposeScanbeamList;
   FJoinList.Free;
   FGhostJoinList.Free;
-  FPolyOutList.Free;
   FIntersectList.Free;
-end;
-//------------------------------------------------------------------------------
-
-procedure TClipper.DisposeScanbeamList;
-var
-  SB: PScanbeam;
-begin
-  while Assigned(fScanbeam) do
-  begin
-    SB := FScanbeam.Next;
-    Dispose(fScanbeam);
-    FScanbeam := SB;
-  end;
-end;
-//------------------------------------------------------------------------------
-
-procedure TClipper.Reset;
-var
-  Lm: PLocalMinima;
-begin
-  inherited Reset;
-  FScanbeam := nil;
-  Lm := FLmList;
-  while Assigned(Lm) do
-  begin
-    InsertScanbeam(Lm.Y);
-    Lm := Lm.Next;
-  end;
 end;
 //------------------------------------------------------------------------------
 
 function TClipper.Execute(clipType: TClipType;
   out solution: TPaths;
-  subjFillType: TPolyFillType = pftEvenOdd;
-  clipFillType: TPolyFillType = pftEvenOdd): Boolean;
+  FillType: TPolyFillType = pftEvenOdd): Boolean;
+begin
+  Result := Execute(clipType, solution, FillType, FillType);
+end;
+//------------------------------------------------------------------------------
+
+function TClipper.Execute(clipType: TClipType;
+  out solution: TPaths;
+  subjFillType: TPolyFillType; clipFillType: TPolyFillType): Boolean;
 begin
   Result := False;
   solution := nil;
@@ -1929,7 +2238,8 @@ begin
     FClipType := clipType;
     FUsingPolyTree := False;
     Result := ExecuteInternal;
-    solution := BuildResult;
+    if Result then
+      solution := BuildResult;
   except
     solution := nil;
     Result := False;
@@ -1943,8 +2253,16 @@ end;
 
 function TClipper.Execute(clipType: TClipType;
   out PolyTree: TPolyTree;
-  subjFillType: TPolyFillType = pftEvenOdd;
-  clipFillType: TPolyFillType = pftEvenOdd): Boolean;
+  FillType: TPolyFillType = pftEvenOdd): Boolean;
+begin
+  Result := Execute(clipType, PolyTree, FillType, FillType);
+end;
+//------------------------------------------------------------------------------
+
+function TClipper.Execute(clipType: TClipType;
+  out PolyTree: TPolyTree;
+  subjFillType: TPolyFillType;
+  clipFillType: TPolyFillType): Boolean;
 begin
   Result := False;
   if FExecuteLocked or not Assigned(PolyTree) then Exit;
@@ -1990,20 +2308,19 @@ var
 begin
   try
     Reset;
-    Result := Assigned(fScanbeam);
-    if not Result then Exit;
-
-    BotY := PopScanbeam;
-    repeat
-      InsertLocalMinimaIntoAEL(BotY);
+    FSortedEdges := nil;
+    Result := false;
+    if not PopScanbeam(BotY) then Exit;
+    InsertLocalMinimaIntoAEL(BotY);
+    while PopScanbeam(TopY) or LocalMinimaPending do
+    begin
+      ProcessHorizontals;
       ClearGhostJoins;
-      ProcessHorizontals(False);
-      if not assigned(FScanbeam) then Break;
-      TopY := PopScanbeam;
-      if not ProcessIntersections(BotY, TopY) then Exit;
+      if not ProcessIntersections(TopY) then Exit;
       ProcessEdgesAtTopOfScanbeam(TopY);
       BotY := TopY;
-    until not assigned(FScanbeam) and not assigned(CurrentLm);
+      InsertLocalMinimaIntoAEL(BotY);
+    end;
 
     //fix orientations ...
     for I := 0 to FPolyOutList.Count -1 do
@@ -2020,12 +2337,14 @@ begin
     for I := 0 to FPolyOutList.Count -1 do
     begin
       OutRec := FPolyOutList[I];
-      if Assigned(OutRec.Pts) and not OutRec.IsOpen then
+      if not Assigned(OutRec.Pts) then continue;
+      if OutRec.IsOpen then
+        FixupOutPolyline(OutRec)
+      else
         FixupOutPolygon(OutRec);
     end;
 
     if FStrictSimple then DoSimplePolygons;
-
     Result := True;
   finally
     ClearJoins;
@@ -2034,62 +2353,51 @@ begin
 end;
 //------------------------------------------------------------------------------
 
-procedure TClipper.InsertScanbeam(const Y: cInt);
+procedure TClipper.InsertMaxima(const X: cInt);
 var
-  Sb, Sb2: PScanbeam;
+  newMax, m: PMaxima;
 begin
-  new(Sb);
-  Sb.Y := Y;
-  if not Assigned(fScanbeam) then
+  //double-linked list: sorted ascending, ignoring dups.
+  new(newMax);
+  newMax.X := X;
+  if not Assigned(FMaxima) then
   begin
-    FScanbeam := Sb;
-    Sb.Next := nil;
-  end else if Y > FScanbeam.Y then
+    FMaxima := newMax;
+    newMax.Next := nil;
+    newMax.Prev := nil;
+  end else if X < FMaxima.X then
   begin
-    Sb.Next := FScanbeam;
-    FScanbeam := Sb;
+    newMax.Next := FMaxima;
+    newMax.Prev := nil;
+    FMaxima.Prev := newMax;
+    FMaxima := newMax;
   end else
   begin
-    Sb2 := FScanbeam;
-    while Assigned(Sb2.Next) and (Y <= Sb2.Next.Y) do Sb2 := Sb2.Next;
-    if Y <> Sb2.Y then
+    m := FMaxima;
+    while Assigned(m.Next) and (X >= m.Next.X) do m := m.Next;
+    if X <> m.X then
     begin
-      Sb.Next := Sb2.Next;
-      Sb2.Next := Sb;
+      //insert m1 between m2 and m2.Next ...
+      newMax.Next := m.Next;
+      newMax.Prev := m;
+      if assigned(m.Next) then m.Next.Prev := newMax;
+      m.Next := newMax;
     end
-    else dispose(Sb); //ie ignores duplicates
+    else dispose(newMax);
   end;
 end;
 //------------------------------------------------------------------------------
 
-function TClipper.PopScanbeam: cInt;
+procedure TClipper.DisposeMaximaList;
 var
-  Sb: PScanbeam;
+  m: PMaxima;
 begin
-  Result := FScanbeam.Y;
-  Sb := FScanbeam;
-  FScanbeam := FScanbeam.Next;
-  dispose(Sb);
-end;
-//------------------------------------------------------------------------------
-
-procedure TClipper.DisposeAllOutRecs;
-var
-  I: Integer;
-begin
-  for I := 0 to FPolyOutList.Count -1 do DisposeOutRec(I);
-  FPolyOutList.Clear;
-end;
-//------------------------------------------------------------------------------
-
-procedure TClipper.DisposeOutRec(Index: Integer);
-var
-  OutRec: POutRec;
-begin
-  OutRec := FPolyOutList[Index];
-  if Assigned(OutRec.Pts) then DisposePolyPts(OutRec.Pts);
-  Dispose(OutRec);
-  FPolyOutList[Index] := nil;
+  while Assigned(FMaxima) do
+  begin
+    m := FMaxima.Next;
+    Dispose(FMaxima);
+    FMaxima := m;
+  end;
 end;
 //------------------------------------------------------------------------------
 
@@ -2097,6 +2405,7 @@ procedure TClipper.SetWindingCount(Edge: PEdge);
 var
   E, E2: PEdge;
   Inside: Boolean;
+  pft: TPolyFillType;
 begin
   E := Edge.PrevInAEL;
   //find the Edge of the same PolyType that immediately preceeds 'Edge' in AEL
@@ -2104,8 +2413,15 @@ begin
     E := E.PrevInAEL;
   if not Assigned(E) then
   begin
-    if Edge.WindDelta = 0 then Edge.WindCnt := 1
-    else Edge.WindCnt := Edge.WindDelta;
+    if Edge.WindDelta = 0 then
+    begin
+      if edge.PolyType = ptSubject then
+        pft := FSubjFillType else
+        pft :=  FClipFillType;
+      if pft = pftNegative then
+        Edge.WindCnt := -1 else
+        Edge.WindCnt := 1;
+    end else Edge.WindCnt := Edge.WindDelta;
     Edge.WindCnt2 := 0;
     E := FActiveEdges; //ie get ready to calc WindCnt2
   end
@@ -2279,6 +2595,7 @@ function TClipper.AddLocalMinPoly(E1, E2: PEdge; const Pt: TIntPoint): POutPt;
 var
   E, prevE: PEdge;
   OutPt: POutPt;
+  X1, X2: cInt;
 begin
   if (E2.Dx = Horizontal) or (E1.Dx > E2.Dx) then
   begin
@@ -2306,12 +2623,17 @@ begin
   end;
 
   if Assigned(prevE) and (prevE.OutIdx >= 0) and
-    (TopX(prevE, Pt.Y) = TopX(E, Pt.Y)) and
-    SlopesEqual(E, prevE, FUse64BitRange) and
-    (E.WindDelta <> 0) and (prevE.WindDelta <> 0) then
+    (prevE.Top.Y < Pt.Y) and (E.Top.Y < Pt.Y) then
   begin
-    OutPt := AddOutPt(prevE, Pt);
-    AddJoin(Result, OutPt, E.Top);
+    X1 := TopX(prevE, Pt.Y);
+    X2 := TopX(E, Pt.Y);
+    if (X1 = X2) and
+      SlopesEqual(IntPoint(X1, Pt.Y), prevE.Top, IntPoint(X2, Pt.Y), E.Top,
+        FUse64BitRange) and (E.WindDelta <> 0) and (prevE.WindDelta <> 0) then
+    begin
+      OutPt := AddOutPt(prevE, Pt);
+      AddJoin(Result, OutPt, E.Top);
+    end;
   end;
 end;
 //------------------------------------------------------------------------------
@@ -2329,13 +2651,14 @@ begin
     AppendPolygon(E1, E2)
   else
     AppendPolygon(E2, E1);
-end;
+  end;
 //------------------------------------------------------------------------------
 
 procedure TClipper.AddEdgeToSEL(Edge: PEdge);
 begin
-  //SEL pointers in PEdge are reused to build a list of horizontal edges.
-  //However, we don't need to worry about order with horizontal Edge processing.
+  //SEL pointers in PEdge are use to build transient lists of horizontal edges.
+  //However, since we don't need to worry about processing order, all additions
+  //are made to the front of the list ...
   if not Assigned(FSortedEdges) then
   begin
     FSortedEdges := Edge;
@@ -2351,6 +2674,19 @@ begin
 end;
 //------------------------------------------------------------------------------
 
+function TClipper.PopEdgeFromSEL(out E: PEdge): Boolean;
+begin
+  //Pop edge from front of SEL (ie SEL is a FILO list)
+  E := FSortedEdges;
+  Result := assigned(E);
+  if not Result then Exit;
+  FSortedEdges := E.NextInSEL;
+  if Assigned(FSortedEdges) then FSortedEdges.PrevInSEL := nil;
+  E.NextInSEL := nil;
+  E.PrevInSEL := nil;
+end;
+//------------------------------------------------------------------------------
+
 procedure TClipper.CopyAELToSEL;
 var
   E: PEdge;
@@ -2362,6 +2698,49 @@ begin
     E.PrevInSEL := E.PrevInAEL;
     E.NextInSEL := E.NextInAEL;
     E := E.NextInAEL;
+  end;
+end;
+//------------------------------------------------------------------------------
+
+function TClipper.AddOutPt(E: PEdge; const Pt: TIntPoint): POutPt;
+var
+  OutRec: POutRec;
+  PrevOp, Op: POutPt;
+  ToFront: Boolean;
+begin
+  if E.OutIdx < 0 then
+  begin
+    OutRec := CreateOutRec;
+    OutRec.IsOpen := (E.WindDelta = 0);
+    new(Result);
+    OutRec.Pts := Result;
+    Result.Pt := Pt;
+    Result.Next := Result;
+    Result.Prev := Result;
+    Result.Idx := OutRec.Idx;
+    if not OutRec.IsOpen then
+      SetHoleState(E, OutRec);
+    E.OutIdx := OutRec.Idx;
+  end else
+  begin
+    ToFront := E.Side = esLeft;
+    OutRec := FPolyOutList[E.OutIdx];
+    //OutRec.Pts is the 'left-most' point & OutRec.Pts.Prev is the 'right-most'
+    Op := OutRec.Pts;
+    if ToFront then PrevOp := Op else PrevOp := Op.Prev;
+    if PointsEqual(Pt, PrevOp.Pt) then
+    begin
+      Result := PrevOp;
+      Exit;
+    end;
+    new(Result);
+    Result.Pt := Pt;
+    Result.Idx := OutRec.Idx;
+    Result.Next := Op;
+    Result.Prev := Op.Prev;
+    Op.Prev.Next := Result;
+    Op.Prev := Result;
+    if ToFront then OutRec.Pts := Result;
   end;
 end;
 //------------------------------------------------------------------------------
@@ -2392,6 +2771,9 @@ procedure TClipper.AddGhostJoin(OutPt: POutPt; const OffPt: TIntPoint);
 var
   Jr: PJoin;
 begin
+  //Ghost joins are used to find horizontal edges at the top of one scanbeam
+  //that coincide with horizontal edges at the bottom of the next. Ghost joins
+  //are converted to real joins when match ups occur.
   new(Jr);
   Jr.OutPt1 := OutPt;
   Jr.OffPt := OffPt;
@@ -2419,17 +2801,11 @@ begin
 end;
 //------------------------------------------------------------------------------
 
-function HorzSegmentsOverlap(const Pt1a, Pt1b, Pt2a, Pt2b: TIntPoint): Boolean;
+function HorzSegmentsOverlap(seg1a, seg1b, seg2a, seg2b: cInt): Boolean;
 begin
-  //precondition: both segments are horizontal
-  Result := true;
-  if (Pt1a.X > Pt2a.X) = (Pt1a.X < Pt2b.X) then Exit
-  else if (Pt1b.X > Pt2a.X) = (Pt1b.X < Pt2b.X) then Exit
-  else if (Pt2a.X > Pt1a.X) = (Pt2a.X < Pt1b.X) then Exit
-  else if (Pt2b.X > Pt1a.X) = (Pt2b.X < Pt1b.X) then Exit
-  else if (Pt1a.X = Pt2a.X) and (Pt1b.X = Pt2b.X) then Exit
-  else if (Pt1a.X = Pt2b.X) and (Pt1b.X = Pt2a.X) then Exit
-  else Result := False;
+  if (seg1a > seg1b) then Swap(seg1a, seg1b);
+  if (seg2a > seg2b) then Swap(seg2a, seg2b);
+  Result := (seg1a < seg2b) and (seg2a < seg1b);
 end;
 //------------------------------------------------------------------------------
 
@@ -2438,6 +2814,7 @@ function E2InsertsBeforeE1(E1, E2: PEdge): Boolean;
 begin
   if E2.Curr.X = E1.Curr.X then
   begin
+    //nb: E1.Top.Y == E2.Bot.Y only occurs when an earlier Rb is horizontal
     if E2.Top.Y > E1.Top.Y then
       Result := E2.Top.X < TopX(E1, E2.Top.Y) else
       Result := E1.Top.X > TopX(E2, E1.Top.Y);
@@ -2484,15 +2861,14 @@ var
   Lb, Rb: PEdge;
   Jr: PJoin;
   Op1, Op2: POutPt;
+  LocMin: PLocalMinimum;
 begin
-  while Assigned(CurrentLm) and (CurrentLm.Y = BotY) do
+  //Add any local minima at BotY ...
+  while PopLocalMinima(BotY, LocMin) do
   begin
-    Lb := CurrentLm.LeftBound;
-    Rb := CurrentLm.RightBound;
-    PopLocalMinima;
-
+    Lb := LocMin.LeftBound;
+    Rb := LocMin.RightBound;
     Op1 := nil;
-
     if not assigned(Lb) then
     begin
       InsertEdgeIntoAEL(Rb, nil);
@@ -2522,7 +2898,11 @@ begin
     if Assigned(Rb) then
     begin
       if (Rb.Dx = Horizontal) then
-        AddEdgeToSEL(Rb) else
+      begin
+        AddEdgeToSEL(Rb);
+        if assigned(Rb.NextInLML) then
+          InsertScanbeam(Rb.NextInLML.Top.Y);
+      end else
         InsertScanbeam(Rb.Top.Y);
     end;
 
@@ -2537,15 +2917,17 @@ begin
         //if the horizontal Rb and a 'ghost' horizontal overlap, then convert
         //the 'ghost' join to a real join ready for later ...
         Jr := PJoin(FGhostJoinList[I]);
-        if HorzSegmentsOverlap(Jr.OutPt1.Pt, Jr.OffPt, Rb.Bot, Rb.Top) then
-          AddJoin(Jr.OutPt1, Op1, Jr.OffPt);
+        if HorzSegmentsOverlap(Jr.OutPt1.Pt.X, Jr.OffPt.X,
+          Rb.Bot.X, Rb.Top.X) then
+            AddJoin(Jr.OutPt1, Op1, Jr.OffPt);
       end;
     end;
 
     if (Lb.OutIdx >= 0) and assigned(Lb.PrevInAEL) and
       (Lb.PrevInAEL.Curr.X = Lb.Bot.X) and
       (Lb.PrevInAEL.OutIdx >= 0) and
-      SlopesEqual(Lb.PrevInAEL, Lb, FUse64BitRange) and
+      SlopesEqual(Lb.PrevInAEL.Curr, Lb.PrevInAEL.Top,
+      Lb.Curr, Lb.Top, FUse64BitRange) and
       (Lb.WindDelta <> 0) and (Lb.PrevInAEL.WindDelta <> 0) then
     begin
         Op2 := AddOutPt(Lb.PrevInAEL, Lb.Bot);
@@ -2555,7 +2937,8 @@ begin
     if (Lb.NextInAEL <> Rb) then
     begin
       if (Rb.OutIdx >= 0) and (Rb.PrevInAEL.OutIdx >= 0) and
-        SlopesEqual(Rb.PrevInAEL, Rb, FUse64BitRange) and
+        SlopesEqual(Rb.PrevInAEL.Curr, Rb.PrevInAEL.Top,
+        Rb.Curr, Rb.Top, FUse64BitRange) and
         (Rb.WindDelta <> 0) and (Rb.PrevInAEL.WindDelta <> 0) then
       begin
           Op2 := AddOutPt(Rb.PrevInAEL, Rb.Bot);
@@ -2576,42 +2959,8 @@ begin
 end;
 //------------------------------------------------------------------------------
 
-procedure TClipper.DeleteFromAEL(E: PEdge);
+procedure TClipper.IntersectEdges(E1,E2: PEdge; Pt: TIntPoint);
 var
-  AelPrev, AelNext: PEdge;
-begin
-  AelPrev := E.PrevInAEL;
-  AelNext := E.NextInAEL;
-  if not Assigned(AelPrev) and not Assigned(AelNext) and
-    (E <> FActiveEdges) then Exit; //already deleted
-  if Assigned(AelPrev) then AelPrev.NextInAEL := AelNext
-  else FActiveEdges := AelNext;
-  if Assigned(AelNext) then AelNext.PrevInAEL := AelPrev;
-  E.NextInAEL := nil;
-  E.PrevInAEL := nil;
-end;
-//------------------------------------------------------------------------------
-
-procedure TClipper.DeleteFromSEL(E: PEdge);
-var
-  SelPrev, SelNext: PEdge;
-begin
-  SelPrev := E.PrevInSEL;
-  SelNext := E.NextInSEL;
-  if not Assigned(SelPrev) and not Assigned(SelNext) and
-    (E <> FSortedEdges) then Exit; //already deleted
-  if Assigned(SelPrev) then SelPrev.NextInSEL := SelNext
-  else FSortedEdges := SelNext;
-  if Assigned(SelNext) then SelNext.PrevInSEL := SelPrev;
-  E.NextInSEL := nil;
-  E.PrevInSEL := nil;
-end;
-//------------------------------------------------------------------------------
-
-procedure TClipper.IntersectEdges(E1,E2: PEdge;
-  const Pt: TIntPoint; Protect: Boolean = False);
-var
-  E1stops, E2stops: Boolean;
   E1Contributing, E2contributing: Boolean;
   E1FillType, E2FillType, E1FillType2, E2FillType2: TPolyFillType;
   E1Wc, E2Wc, E1Wc2, E2Wc2: Integer;
@@ -2620,24 +2969,19 @@ begin
   //E1 will be to the left of E2 BELOW the intersection. Therefore E1 is before
   //E2 in AEL except when E1 is being inserted at the intersection point ...
 
-  E1stops := not Protect and not Assigned(E1.NextInLML) and
-    (E1.Top.X = Pt.x) and (E1.Top.Y = Pt.Y);
-  E2stops := not Protect and not Assigned(E2.NextInLML) and
-    (E2.Top.X = Pt.x) and (E2.Top.Y = Pt.Y);
   E1Contributing := (E1.OutIdx >= 0);
   E2contributing := (E2.OutIdx >= 0);
+
+{$IFDEF use_xyz}
+        SetZ(Pt, E1, E2, FZFillCallback);
+{$ENDIF}
 
 {$IFDEF use_lines}
   //if either edge is on an OPEN path ...
   if (E1.WindDelta = 0) or (E2.WindDelta = 0) then
   begin
-    //ignore subject-subject open path intersections UNLESS they
-    //are both open paths, AND they are both 'contributing maximas' ...
-    if (E1.WindDelta = 0) AND (E2.WindDelta = 0) then
-    begin
-      if (E1stops or E2stops) and E1Contributing and E2Contributing then
-        AddLocalMaxPoly(E1, E2, Pt);
-    end
+    //ignore subject-subject open path intersections ...
+    if (E1.WindDelta = 0) AND (E2.WindDelta = 0) then Exit
     //if intersecting a subj line with a subj poly ...
     else if (E1.PolyType = E2.PolyType) and
       (E1.WindDelta <> E2.WindDelta) and (FClipType = ctUnion) then
@@ -2674,14 +3018,6 @@ begin
         if E2Contributing then E2.OutIdx := Unassigned;
       end
     end;
-
-    if E1stops then
-      if (E1.OutIdx < 0) then deleteFromAEL(E1)
-
-      else raise Exception.Create(rsPolylines);
-    if E2stops then
-      if (E2.OutIdx < 0) then deleteFromAEL(E2)
-      else raise Exception.Create(rsPolylines);
     Exit;
   end;
 {$ENDIF}
@@ -2747,7 +3083,7 @@ begin
 
   if E1Contributing and E2contributing then
   begin
-    if E1stops or E2stops or not (E1Wc in [0,1]) or not (E2Wc in [0,1]) or
+    if not (E1Wc in [0,1]) or not (E2Wc in [0,1]) or
       ((E1.PolyType <> E2.PolyType) and (fClipType <> ctXor)) then
     begin
         AddLocalMaxPoly(E1, E2, Pt);
@@ -2776,8 +3112,7 @@ begin
       SwapPolyIndexes(E1, E2);
     end;
   end
-  else if  ((E1Wc = 0) or (E1Wc = 1)) and ((E2Wc = 0) or (E2Wc = 1)) and
-    not E1stops and not E2stops then
+  else if  ((E1Wc = 0) or (E1Wc = 1)) and ((E2Wc = 0) or (E2Wc = 1)) then
   begin
     //neither Edge is currently contributing ...
 
@@ -2793,7 +3128,9 @@ begin
     end;
 
     if (E1.PolyType <> E2.PolyType) then
-      AddLocalMinPoly(E1, E2, Pt)
+    begin
+      AddLocalMinPoly(E1, E2, Pt);
+    end
     else if (E1Wc = 1) and (E2Wc = 1) then
       case FClipType of
         ctIntersection:
@@ -2812,17 +3149,6 @@ begin
     else
       swapsides(E1,E2);
   end;
-
-  if (E1stops <> E2stops) and
-    ((E1stops and (E1.OutIdx >= 0)) or (E2stops and (E2.OutIdx >= 0))) then
-  begin
-    swapsides(E1,E2);
-    SwapPolyIndexes(E1, E2);
-  end;
-
-  //finally, delete any non-contributing maxima edges  ...
-  if E1stops then deleteFromAEL(E1);
-  if E2stops then deleteFromAEL(E2);
 end;
 //------------------------------------------------------------------------------
 
@@ -2849,8 +3175,12 @@ begin
   P := btmPt2.Next;
   while PointsEqual(P.Pt, btmPt2.Pt) and (P <> btmPt2) do P := P.Next;
   Dx2n := abs(GetDx(btmPt2.Pt, P.Pt));
-  Result := ((Dx1p >= Dx2p) and (Dx1p >= Dx2n)) or
-    ((Dx1n >= Dx2p) and (Dx1n >= Dx2n));
+  if (Max(Dx1p, Dx1n) = Max(Dx2p, Dx2n)) and
+    (Min(Dx1p, Dx1n) = Min(Dx2p, Dx2n)) then
+      Result := Area(btmPt1) > 0 //if otherwise identical use orientation
+  else
+    Result := ((Dx1p >= Dx2p) and (Dx1p >= Dx2n)) or
+      ((Dx1n >= Dx2p) and (Dx1n >= Dx2n));
 end;
 //------------------------------------------------------------------------------
 
@@ -2896,23 +3226,33 @@ end;
 
 procedure TClipper.SetHoleState(E: PEdge; OutRec: POutRec);
 var
-  E2: PEdge;
-  IsHole: Boolean;
+  E2, eTmp: PEdge;
 begin
-  IsHole := False;
+  //E.FirstLeft is the parent/container OutRec of E if any, and is the first
+  //unpaired OutRec to the left in AEL. (Paired OutRecs will either be a
+  //sibling of E or a sibling of one of its 'parents'.)
+  eTmp := nil;
   E2 := E.PrevInAEL;
   while Assigned(E2) do
   begin
     if (E2.OutIdx >= 0) and (E2.WindDelta <> 0) then
     begin
-      IsHole := not IsHole;
-      if not Assigned(OutRec.FirstLeft) then
-        OutRec.FirstLeft := POutRec(fPolyOutList[E2.OutIdx]);
+      if not assigned(eTmp) then
+        eTmp := E2
+      else if (eTmp.OutIdx = E2.OutIdx) then
+        eTmp := nil; //paired
     end;
     E2 := E2.PrevInAEL;
   end;
-  if IsHole then
-    OutRec.IsHole := True;
+  if assigned(eTmp) then
+  begin
+    OutRec.FirstLeft := POutRec(fPolyOutList[eTmp.OutIdx]);
+    OutRec.IsHole := not OutRec.FirstLeft.IsHole;
+  end else
+  begin
+    OutRec.FirstLeft := nil;
+    OutRec.IsHole := False;
+  end;
 end;
 //------------------------------------------------------------------------------
 
@@ -2937,7 +3277,7 @@ begin
 end;
 //------------------------------------------------------------------------------
 
-function Param1RightOfParam2(OutRec1, OutRec2: POutRec): Boolean;
+function OutRec1RightOfOutRec2(OutRec1, OutRec2: POutRec): Boolean;
 begin
   Result := True;
   repeat
@@ -2960,7 +3300,6 @@ procedure TClipper.AppendPolygon(E1, E2: PEdge);
 var
   HoleStateRec, OutRec1, OutRec2: POutRec;
   P1_lft, P1_rt, P2_lft, P2_rt: POutPt;
-  NewSide: TEdgeSide;
   OKIdx, ObsoleteIdx: Integer;
   E: PEdge;
 begin
@@ -2970,8 +3309,8 @@ begin
   //First work out which polygon fragment has the correct hole state.
   //Since we're working from the bottom upward and left to right, the left most
   //and lowermost polygon is outermost and must have the correct hole state ...
-  if Param1RightOfParam2(OutRec1, OutRec2) then HoleStateRec := OutRec2
-  else if Param1RightOfParam2(OutRec2, OutRec1) then HoleStateRec := OutRec1
+  if OutRec1RightOfOutRec2(OutRec1, OutRec2) then HoleStateRec := OutRec2
+  else if OutRec1RightOfOutRec2(OutRec2, OutRec1) then HoleStateRec := OutRec1
   else HoleStateRec := GetLowermostRec(OutRec1, OutRec2);
 
   //get the start and ends of both output polygons and
@@ -3002,7 +3341,6 @@ begin
       P1_rt.Next := P2_lft;
       OutRec1.Pts := P2_lft;
     end;
-    NewSide := esLeft;
   end else
   begin
     if E2.Side = esRight then
@@ -3021,7 +3359,6 @@ begin
       P1_lft.Prev := P2_rt;
       P2_rt.Next := P1_lft;
     end;
-    NewSide := esRight;
   end;
 
   OutRec1.BottomPt := nil;
@@ -3048,7 +3385,7 @@ begin
     if (E.OutIdx = ObsoleteIdx) then
     begin
       E.OutIdx := OKIdx;
-      E.Side := NewSide;
+      E.Side := E1.Side;
       Break;
     end;
     E := E.NextInAEL;
@@ -3058,88 +3395,23 @@ begin
 end;
 //------------------------------------------------------------------------------
 
-function TClipper.CreateOutRec: POutRec;
-begin
-  new(Result);
-  Result.IsHole := False;
-  Result.IsOpen := False;
-  Result.FirstLeft := nil;
-  Result.Pts := nil;
-  Result.BottomPt := nil;
-  Result.PolyNode := nil;
-  Result.Idx := FPolyOutList.Add(Result);
-end;
-//------------------------------------------------------------------------------
-
-function TClipper.AddOutPt(E: PEdge; const Pt: TIntPoint): POutPt;
+function TClipper.GetLastOutPt(E: PEdge): POutPt;
 var
   OutRec: POutRec;
-  PrevOp, Op: POutPt;
-  ToFront: Boolean;
 begin
-  ToFront := E.Side = esLeft;
-  if E.OutIdx < 0 then
-  begin
-    OutRec := CreateOutRec;
-    OutRec.IsOpen := (E.WindDelta = 0);
-    new(Result);
-    OutRec.Pts := Result;
-    Result.Pt := Pt;
-    Result.Next := Result;
-    Result.Prev := Result;
-    Result.Idx := OutRec.Idx;
-    if not OutRec.IsOpen then
-      SetHoleState(E, OutRec);
-{$IFDEF use_xyz}
-    if PointsEqual(E.Bot, Pt) then
-      Result.Pt.Z := E.Bot.Z
-    else if PointsEqual(E.Top, Pt) then
-      Result.Pt.Z := E.Top.Z
-    else
-      SetZ(Result.Pt, E, FZFillCallback);
-{$ENDIF}
-    E.OutIdx := OutRec.Idx; //nb: do this after SetZ !
-  end else
-  begin
-    OutRec := FPolyOutList[E.OutIdx];
-    //OutRec.Pts is the 'left-most' point & OutRec.Pts.Prev is the 'right-most'
-    Op := OutRec.Pts;
-    if ToFront then PrevOp := Op else PrevOp := Op.Prev;
-    if PointsEqual(Pt, PrevOp.Pt) then
-    begin
-      Result := PrevOp;
-      Exit;
-    end;
-    new(Result);
-    Result.Pt := Pt;
-    Result.Idx := OutRec.Idx;
-    Result.Next := Op;
-    Result.Prev := Op.Prev;
-    Op.Prev.Next := Result;
-    Op.Prev := Result;
-    if ToFront then OutRec.Pts := Result;
-{$IFDEF use_xyz}
-    if PointsEqual(E.Bot, Pt) then
-      Result.Pt.Z := E.Bot.Z
-    else if PointsEqual(E.Top, Pt) then
-      Result.Pt.Z := E.Top.Z
-    else
-      SetZ(Result.Pt, E, FZFillCallback);
-{$ENDIF}
-  end;
+  OutRec := FPolyOutList[E.OutIdx];
+  if E.Side = esLeft then
+    Result := OutRec.Pts else
+    Result := OutRec.Pts.Prev;
 end;
 //------------------------------------------------------------------------------
 
-procedure TClipper.ProcessHorizontals(IsTopOfScanbeam: Boolean);
+procedure TClipper.ProcessHorizontals;
 var
   E: PEdge;
 begin
-  while Assigned(fSortedEdges) do
-  begin
-    E := FSortedEdges;
-    DeleteFromSEL(E);
-    ProcessHorizontal(E, IsTopOfScanbeam);
-  end;
+  while PopEdgeFromSEL(E) do
+    ProcessHorizontal(E);
 end;
 //------------------------------------------------------------------------------
 
@@ -3149,13 +3421,15 @@ begin
 end;
 //------------------------------------------------------------------------------
 
-function IsMaxima(E: PEdge; const Y: cInt): Boolean; {$IFDEF INLINING} inline; {$ENDIF}
+function IsMaxima(E: PEdge; const Y: cInt): Boolean;
+{$IFDEF INLINING} inline; {$ENDIF}
 begin
   Result := Assigned(E) and (E.Top.Y = Y) and not Assigned(E.NextInLML);
 end;
 //------------------------------------------------------------------------------
 
-function IsIntermediate(E: PEdge; const Y: cInt): Boolean; {$IFDEF INLINING} inline; {$ENDIF}
+function IsIntermediate(E: PEdge; const Y: cInt): Boolean;
+{$IFDEF INLINING} inline; {$ENDIF}
 begin
   Result := (E.Top.Y = Y) and Assigned(E.NextInLML);
 end;
@@ -3169,57 +3443,16 @@ begin
     Result := E.Prev
   else
     Result := nil;
-  if assigned(Result) and ((Result.OutIdx = Skip) or
-    //result is false if both NextInAEL & PrevInAEL are nil & not horizontal ...
-    ((Result.NextInAEL = Result.PrevInAEL) and (Result.Dx <> Horizontal))) then
-      Result := nil;
 end;
 //------------------------------------------------------------------------------
 
-procedure TClipper.SwapPositionsInAEL(E1, E2: PEdge);
-var
-  Prev,Next: PEdge;
+function GetMaximaPairEx(E: PEdge): PEdge;
 begin
-  //check that one or other edge hasn't already been removed from AEL ...
-  if (E1.NextInAEL = E1.PrevInAEL) or (E2.NextInAEL = E2.PrevInAEL) then
-    Exit;
-
-  if E1.NextInAEL = E2 then
-  begin
-    Next := E2.NextInAEL;
-    if Assigned(Next) then Next.PrevInAEL := E1;
-    Prev := E1.PrevInAEL;
-    if Assigned(Prev) then Prev.NextInAEL := E2;
-    E2.PrevInAEL := Prev;
-    E2.NextInAEL := E1;
-    E1.PrevInAEL := E2;
-    E1.NextInAEL := Next;
-  end
-  else if E2.NextInAEL = E1 then
-  begin
-    Next := E1.NextInAEL;
-    if Assigned(Next) then Next.PrevInAEL := E2;
-    Prev := E2.PrevInAEL;
-    if Assigned(Prev) then Prev.NextInAEL := E1;
-    E1.PrevInAEL := Prev;
-    E1.NextInAEL := E2;
-    E2.PrevInAEL := E1;
-    E2.NextInAEL := Next;
-  end else
-  begin
-    Next := E1.NextInAEL;
-    Prev := E1.PrevInAEL;
-    E1.NextInAEL := E2.NextInAEL;
-    if Assigned(E1.NextInAEL) then E1.NextInAEL.PrevInAEL := E1;
-    E1.PrevInAEL := E2.PrevInAEL;
-    if Assigned(E1.PrevInAEL) then E1.PrevInAEL.NextInAEL := E1;
-    E2.NextInAEL := Next;
-    if Assigned(E2.NextInAEL) then E2.NextInAEL.PrevInAEL := E2;
-    E2.PrevInAEL := Prev;
-    if Assigned(E2.PrevInAEL) then E2.PrevInAEL.NextInAEL := E2;
-  end;
-  if not Assigned(E1.PrevInAEL) then FActiveEdges := E1
-  else if not Assigned(E2.PrevInAEL) then FActiveEdges := E2;
+  //as above but returns nil if MaxPair isn't in AEL (unless it's horizontal)
+  Result := GetMaximaPair(E);
+  if not assigned(Result) or (Result.OutIdx = Skip) or
+    ((Result.NextInAEL = Result.PrevInAEL) and not IsHorizontal(Result)) then
+      Result := nil;
 end;
 //------------------------------------------------------------------------------
 
@@ -3292,44 +3525,15 @@ begin
 end;
 //------------------------------------------------------------------------
 
-procedure TClipper.ProcessHorizontal(HorzEdge: PEdge; IsTopOfScanbeam: Boolean);
-
-  procedure PrepareHorzJoins;
-  var
-    //I: Integer;
-    OutPt: POutPt;
-  begin
-    //get the last Op for this horizontal edge
-    //the point may be anywhere along the horizontal ...
-    OutPt := POutRec(FPolyOutList[HorzEdge.OutIdx]).Pts;
-    if HorzEdge.Side <> esLeft then OutPt := OutPt.Prev;
-
-//    //First, match up overlapping horizontal edges (eg when one polygon's
-//    //intermediate horz edge overlaps an intermediate horz edge of another, or
-//    //when one polygon sits on top of another) ...
-//      for I := 0 to FGhostJoinList.Count -1 do
-//        with PJoin(FGhostJoinList[I])^ do
-//          if HorzSegmentsOverlap(OutPt1.Pt, OffPt,
-//            HorzEdge.Bot, HorzEdge.Top) then
-//              AddJoin(OutPt1, OutPt, OffPt);
-
-    //Also, since horizontal edges at the top of one SB are often removed from
-    //the AEL before we process the horizontal edges at the bottom of the next,
-    //we need to create 'ghost' Join records of 'contrubuting' horizontals that
-    //we can compare with horizontals at the bottom of the next SB.
-    if IsTopOfScanbeam then
-      if PointsEqual(OutPt.Pt, HorzEdge.Top) then
-        AddGhostJoin(OutPt, HorzEdge.Bot) else
-        AddGhostJoin(OutPt, HorzEdge.Top);
-  end;
-
+procedure TClipper.ProcessHorizontal(HorzEdge: PEdge);
 var
-  E, eNext, ePrev, eMaxPair, eLastHorz: PEdge;
+  E, eNext, eNextHorz, ePrev, eMaxPair, eLastHorz: PEdge;
   HorzLeft, HorzRight: cInt;
   Direction: TDirection;
   Pt: TIntPoint;
   Op1, Op2: POutPt;
-  IsLastHorz: Boolean;
+  IsLastHorz, IsOpen: Boolean;
+  currMax: PMaxima;
 begin
 (*******************************************************************************
 * Notes: Horizontal edges (HEs) at scanline intersections (ie at the top or    *
@@ -3352,6 +3556,7 @@ begin
 *******************************************************************************)
 
   GetHorzDirection(HorzEdge, Direction, HorzLeft, HorzRight);
+  IsOpen := (HorzEdge.WindDelta = 0);
 
   eLastHorz := HorzEdge;
   while Assigned(eLastHorz.NextInLML) and
@@ -3361,65 +3566,140 @@ begin
     eMaxPair := nil else
     eMaxPair := GetMaximaPair(eLastHorz);
 
-  while true do //loops consec. horizontal edges
+  Op1 := nil;
+  currMax := FMaxima;
+  //nb: FMaxima will only be assigned when the Simplify property is set true.
+
+  if assigned(currMax) then
+  begin
+    //get the first useful Maxima ...
+    if (Direction = dLeftToRight) then
+    begin
+      while Assigned(currMax) and (currMax.X <= HorzEdge.Bot.X) do
+        currMax := currMax.Next;
+      if Assigned(currMax) and (currMax.X >= eLastHorz.Top.X) then
+        currMax := nil;
+    end else
+    begin
+      while Assigned(currMax.Next) and (currMax.Next.X < HorzEdge.Bot.X) do
+        currMax := currMax.Next;
+      if (currMax.X <= eLastHorz.Top.X) then currMax := nil;
+    end;
+  end;
+
+  while true do //loops through consec. horizontal edges
   begin
     IsLastHorz := (HorzEdge = eLastHorz);
     E := GetNextInAEL(HorzEdge, Direction);
     while Assigned(E) do
     begin
-//      if (HorzEdge.OutIdx >= 0) and (HorzEdge.WindDelta <> 0) then
-//        PrepareHorzJoins; ToDo- move here eventually
 
-      //Break if we've got to the end of an intermediate horizontal edge ...
+      //this code block inserts extra coords into horizontal edges (in output
+      //polygons) whereever maxima touch these horizontal edges. This helps
+      //'simplifying' polygons (ie if the Simplify property is set).
+      if assigned(currMax) then
+      begin
+        if (Direction = dLeftToRight) then
+        begin
+          while assigned(currMax) and (currMax.X < E.Curr.X) do
+          begin
+            if (HorzEdge.OutIdx >= 0) and not IsOpen then
+              AddOutPt(HorzEdge, IntPoint(currMax.X, HorzEdge.Bot.Y));
+            currMax := currMax.Next;
+          end;
+        end else
+        begin
+          while assigned(currMax) and (currMax.X > E.Curr.X) do
+          begin
+            if (HorzEdge.OutIdx >= 0) and not IsOpen then
+              AddOutPt(HorzEdge, IntPoint(currMax.X, HorzEdge.Bot.Y));
+            currMax := currMax.Prev;
+          end;
+        end;
+      end;
+
+      if ((Direction = dLeftToRight) and (E.Curr.X > HorzRight)) or
+        ((Direction = dRightToLeft) and (E.Curr.X < HorzLeft)) then
+          Break;
+
+      //also break if we've got to the end of an intermediate horizontal edge
       //nb: Smaller Dx's are to the right of larger Dx's ABOVE the horizontal.
       if (E.Curr.X = HorzEdge.Top.X) and
         Assigned(HorzEdge.NextInLML) and (E.Dx < HorzEdge.NextInLML.Dx) then
           Break;
-      eNext := GetNextInAEL(E, Direction); //saves eNext for later
 
-      if ((Direction = dLeftToRight) and (E.Curr.X <= HorzRight)) or
-        ((Direction = dRightToLeft) and (E.Curr.X >= HorzLeft)) then
+      if (HorzEdge.OutIdx >= 0) and not IsOpen then //may be done multiple times
       begin
-        if (HorzEdge.OutIdx >= 0) and (HorzEdge.WindDelta <> 0) then
-          PrepareHorzJoins; //ToDo - move above eventually
-        //so far we're still in range of the horizontal Edge  but make sure
-        //we're at the last of consec. horizontals when matching with eMaxPair
-        if (E = eMaxPair) and IsLastHorz then
+{$IFDEF use_xyz}
+      if (Direction = dLeftToRight) then SetZ(E.Curr, HorzEdge, E, FZFillCallback)
+      else SetZ(E.Curr, E, HorzEdge, FZFillCallback);
+{$ENDIF}
+        Op1 := AddOutPt(HorzEdge, E.Curr);
+        eNextHorz := FSortedEdges;
+        while Assigned(eNextHorz) do
         begin
-          if Direction = dLeftToRight then
-            IntersectEdges(HorzEdge, E, E.Top) else
-            IntersectEdges(E, HorzEdge, E.Top);
-          if (eMaxPair.OutIdx >= 0) then raise exception.Create(rsHorizontal);
-          Exit;
-        end
-        else if (Direction = dLeftToRight) then
-        begin
-          Pt := IntPoint(E.Curr.X, HorzEdge.Curr.Y);
-          IntersectEdges(HorzEdge, E, Pt, True);
-        end else
-        begin
-          Pt := IntPoint(E.Curr.X, HorzEdge.Curr.Y);
-          IntersectEdges(E, HorzEdge, Pt, True);
+          if (eNextHorz.OutIdx >= 0) and
+            HorzSegmentsOverlap(HorzEdge.Bot.X,
+            HorzEdge.Top.X, eNextHorz.Bot.X, eNextHorz.Top.X) then
+          begin
+            Op2 := GetLastOutPt(eNextHorz);
+            AddJoin(Op2, Op1, eNextHorz.Top);
+          end;
+          eNextHorz := eNextHorz.NextInSEL;
         end;
-        SwapPositionsInAEL(HorzEdge, E);
-      end
-      else if ((Direction = dLeftToRight) and (E.Curr.X >= HorzRight)) or
-        ((Direction = dRightToLeft) and (E.Curr.X <= HorzLeft)) then
-          Break;
+        AddGhostJoin(Op1, HorzEdge.Bot);
+      end;
+
+      //OK, so far we're still in range of the horizontal Edge  but make sure
+      //we're at the last of consec. horizontals when matching with eMaxPair
+      if (E = eMaxPair) and IsLastHorz then
+      begin
+        if HorzEdge.OutIdx >= 0 then
+          AddLocalMaxPoly(HorzEdge, eMaxPair, HorzEdge.Top);
+        deleteFromAEL(HorzEdge);
+        deleteFromAEL(eMaxPair);
+        Exit;
+      end;
+
+      if (Direction = dLeftToRight) then
+      begin
+        Pt := IntPoint(E.Curr.X, HorzEdge.Curr.Y);
+        IntersectEdges(HorzEdge, E, Pt);
+      end else
+      begin
+        Pt := IntPoint(E.Curr.X, HorzEdge.Curr.Y);
+        IntersectEdges(E, HorzEdge, Pt);
+      end;
+      eNext := GetNextInAEL(E, Direction);
+      SwapPositionsInAEL(HorzEdge, E);
       E := eNext;
     end;
 
-    if (HorzEdge.OutIdx >= 0) and (HorzEdge.WindDelta <> 0) then
-      PrepareHorzJoins;
+    //Break out of loop if HorzEdge.NextInLML is not also horizontal ...
+    if not Assigned(HorzEdge.NextInLML) or
+      (HorzEdge.NextInLML.Dx <> Horizontal) then Break;
 
-    if Assigned(HorzEdge.NextInLML) and
-      (HorzEdge.NextInLML.Dx = Horizontal) then
+    UpdateEdgeIntoAEL(HorzEdge);
+    if (HorzEdge.OutIdx >= 0) then AddOutPt(HorzEdge, HorzEdge.Bot);
+    GetHorzDirection(HorzEdge, Direction, HorzLeft, HorzRight);
+  end;
+
+  if (HorzEdge.OutIdx >= 0) and not Assigned(Op1) then
+  begin
+    Op1 := GetLastOutPt(HorzEdge);
+    eNextHorz := FSortedEdges;
+    while Assigned(eNextHorz) do
     begin
-      UpdateEdgeIntoAEL(HorzEdge);
-      if (HorzEdge.OutIdx >= 0) then AddOutPt(HorzEdge, HorzEdge.Bot);
-      GetHorzDirection(HorzEdge, Direction, HorzLeft, HorzRight);
-    end else
-      Break;
+      if (eNextHorz.OutIdx >= 0) and
+        HorzSegmentsOverlap(HorzEdge.Bot.X,
+        HorzEdge.Top.X, eNextHorz.Bot.X, eNextHorz.Top.X) then
+      begin
+        Op2 := GetLastOutPt(eNextHorz);
+        AddJoin(Op2, Op1, eNextHorz.Top);
+      end;
+      eNextHorz := eNextHorz.NextInSEL;
+    end;
+    AddGhostJoin(Op1, HorzEdge.Top);
   end;
 
   if Assigned(HorzEdge.NextInLML) then
@@ -3427,6 +3707,7 @@ begin
     if (HorzEdge.OutIdx >= 0) then
     begin
       Op1 := AddOutPt(HorzEdge, HorzEdge.Top);
+
       UpdateEdgeIntoAEL(HorzEdge);
       if (HorzEdge.WindDelta = 0) then Exit;
       //nb: HorzEdge is no longer horizontal here
@@ -3450,21 +3731,6 @@ begin
       end;
     end else
       UpdateEdgeIntoAEL(HorzEdge);
-  end
-  else if assigned(eMaxPair) then
-  begin
-    if (eMaxPair.OutIdx >= 0) then
-    begin
-      if Direction = dLeftToRight then
-        IntersectEdges(HorzEdge, eMaxPair, HorzEdge.Top) else
-        IntersectEdges(eMaxPair, HorzEdge, HorzEdge.Top);
-      if (eMaxPair.OutIdx >= 0) then
-        raise exception.Create(rsHorizontal);
-    end else
-    begin
-      DeleteFromAEL(HorzEdge);
-      DeleteFromAEL(eMaxPair);
-    end;
   end else
   begin
     if (HorzEdge.OutIdx >= 0) then AddOutPt(HorzEdge, HorzEdge.Top);
@@ -3473,41 +3739,11 @@ begin
 end;
 //------------------------------------------------------------------------------
 
-procedure TClipper.UpdateEdgeIntoAEL(var E: PEdge);
-var
-  AelPrev, AelNext: PEdge;
-begin
-  //return true when AddOutPt() call needed too
-  if not Assigned(E.NextInLML) then
-    raise exception.Create(rsUpdateEdgeIntoAEL);
-
-  E.NextInLML.OutIdx := E.OutIdx;
-
-  AelPrev := E.PrevInAEL;
-  AelNext := E.NextInAEL;
-  if Assigned(AelPrev) then
-    AelPrev.NextInAEL := E.NextInLML else
-    FActiveEdges := E.NextInLML;
-  if Assigned(AelNext) then
-    AelNext.PrevInAEL := E.NextInLML;
-  E.NextInLML.Side := E.Side;
-  E.NextInLML.WindDelta := E.WindDelta;
-  E.NextInLML.WindCnt := E.WindCnt;
-  E.NextInLML.WindCnt2 := E.WindCnt2;
-  E := E.NextInLML; ////
-  E.Curr := E.Bot;
-  E.PrevInAEL := AelPrev;
-  E.NextInAEL := AelNext;
-  if E.Dx <> Horizontal then
-    InsertScanbeam(E.Top.Y);
-end;
-//------------------------------------------------------------------------------
-
-function TClipper.ProcessIntersections(const BotY, TopY: cInt): Boolean;
+function TClipper.ProcessIntersections(const TopY: cInt): Boolean;
 begin
   Result := True;
   try
-    BuildIntersectList(BotY, TopY);
+    BuildIntersectList(TopY);
     if (FIntersectList.Count = 0) then
       Exit
     else if FixupIntersectionOrder then
@@ -3531,7 +3767,7 @@ begin
 end;
 //------------------------------------------------------------------------------
 
-procedure TClipper.BuildIntersectList(const BotY, TopY: cInt);
+procedure TClipper.BuildIntersectList(const TopY: cInt);
 var
   E, eNext: PEdge;
   Pt: TIntPoint;
@@ -3551,7 +3787,7 @@ begin
     E := E.NextInAEL;
   end;
 
-  //bubblesort ...
+  //bubblesort (because adjacent swaps are required) ...
   repeat
     IsModified := False;
     E := FSortedEdges;
@@ -3560,17 +3796,9 @@ begin
       eNext := E.NextInSEL;
       if (E.Curr.X > eNext.Curr.X) then
       begin
-        if not IntersectPoint(E, eNext, Pt, FUse64BitRange) and
-          (E.Curr.X > eNext.Curr.X +1) then
-            raise Exception.Create(rsIntersect);
-        if (Pt.Y > botY) then
-        begin
-          Pt.Y := botY;
-          if (abs(E.Dx) > abs(eNext.Dx)) then
-            Pt.X := TopX(eNext, botY) else
-            Pt.X := TopX(E, botY);
-        end;
-
+        IntersectPointEx(E, eNext, Pt);
+        if Pt.Y < TopY then
+          Pt := IntPoint(TopX(E, TopY), TopY);
         new(NewNode);
         NewNode.Edge1 := E;
         NewNode.Edge2 := eNext;
@@ -3597,7 +3825,7 @@ begin
   begin
     with PIntersectNode(FIntersectList[I])^ do
     begin
-      IntersectEdges(Edge1, Edge2, Pt, True);
+      IntersectEdges(Edge1, Edge2, Pt);
       SwapPositionsInAEL(Edge1, Edge2);
     end;
     dispose(PIntersectNode(FIntersectList[I]));
@@ -3610,7 +3838,7 @@ procedure TClipper.DoMaxima(E: PEdge);
 var
   ENext, EMaxPair: PEdge;
 begin
-  EMaxPair := GetMaximaPair(E);
+  EMaxPair := GetMaximaPairEx(E);
   if not assigned(EMaxPair) then
   begin
     if E.OutIdx >= 0 then
@@ -3623,7 +3851,7 @@ begin
   //rarely, with overlapping collinear edges (in open paths) ENext can be nil
   while Assigned(ENext) and (ENext <> EMaxPair) do
   begin
-    IntersectEdges(E, ENext, E.Top, True);
+    IntersectEdges(E, ENext, E.Top);
     SwapPositionsInAEL(E, ENext);
     ENext := E.NextInAEL;
   end;
@@ -3635,7 +3863,10 @@ begin
   end
   else if (E.OutIdx >= 0) and (EMaxPair.OutIdx >= 0) then
   begin
-    IntersectEdges(E, EMaxPair, E.Top);
+    if E.OutIdx >= 0 then
+      AddLocalMaxPoly(E, EMaxPair, E.Top);
+    deleteFromAEL(E);
+    deleteFromAEL(eMaxPair);
   end
 {$IFDEF use_lines}
   else if E.WindDelta = 0 then
@@ -3665,6 +3896,7 @@ var
   E, EMaxPair, ePrev, eNext: PEdge;
   Op, Op2: POutPt;
   IsMaximaEdge: Boolean;
+  Pt: TIntPoint;
 begin
 (*******************************************************************************
 * Notes: Processing edges at scanline intersections (ie at the top or bottom   *
@@ -3695,12 +3927,14 @@ begin
     IsMaximaEdge := IsMaxima(E, TopY);
     if IsMaximaEdge then
     begin
-      EMaxPair := GetMaximaPair(E);
+      EMaxPair := GetMaximaPairEx(E);
       IsMaximaEdge := not assigned(EMaxPair) or (EMaxPair.Dx <> Horizontal);
     end;
 
     if IsMaximaEdge then
     begin
+      if FStrictSimple then
+        InsertMaxima(E.Top.X);
       //'E' might be removed from AEL, as may any following edges so ...
       ePrev := E.PrevInAEL;
       DoMaxima(E);
@@ -3720,6 +3954,11 @@ begin
       begin
         E.Curr.X := TopX(E, TopY);
         E.Curr.Y := TopY;
+{$IFDEF use_xyz}
+        if E.Top.Y = TopY then e.Curr.Z := e.Top.Z
+        else if (E.Bot.Y = TopY) then e.Curr.Z := E.Bot.Z else
+        e.Curr.Z := 0;
+{$ENDIF}
       end;
 
       //When StrictlySimple and 'e' is being touched by another edge, then
@@ -3731,9 +3970,13 @@ begin
           Assigned(ePrev) and (ePrev.Curr.X = E.Curr.X) and
           (ePrev.OutIdx >= 0) and (ePrev.WindDelta <> 0) then
         begin
-          Op := AddOutPt(ePrev, E.Curr);
-          Op2 := AddOutPt(E, E.Curr);
-          AddJoin(Op, Op2, E.Curr); //strictly-simple (type-3) 'join'
+          Pt := E.Curr;
+{$IFDEF use_xyz}
+          SetZ(Pt, ePrev, E, FZFillCallback);
+{$ENDIF}
+          Op := AddOutPt(ePrev, Pt);
+          Op2 := AddOutPt(E, Pt);
+          AddJoin(Op, Op2, Pt); //strictly-simple (type-3) 'join'
         end;
       end;
 
@@ -3742,7 +3985,8 @@ begin
   end;
 
   //3. Process horizontals at the top of the scanbeam ...
-  ProcessHorizontals(True);
+  ProcessHorizontals;
+  if FStrictSimple then DisposeMaximaList;
 
   //4. Promote intermediate vertices ...
   E := FActiveEdges;
@@ -3761,7 +4005,7 @@ begin
       if Assigned(ePrev) and (ePrev.Curr.X = E.Bot.X) and
         (ePrev.Curr.Y = E.Bot.Y) and assigned(Op) and
         (ePrev.OutIdx >= 0) and (ePrev.Curr.Y > ePrev.Top.Y) and
-        SlopesEqual(E, ePrev, FUse64BitRange) and
+        SlopesEqual(E.Curr, E.Top, ePrev.Curr, ePrev.Top, FUse64BitRange) and
         (E.WindDelta <> 0) and (ePrev.WindDelta <> 0) then
       begin
         Op2 := AddOutPt(ePrev, E.Bot);
@@ -3770,7 +4014,7 @@ begin
       else if Assigned(eNext) and (eNext.Curr.X = E.Bot.X) and
         (eNext.Curr.Y = E.Bot.Y) and assigned(Op) and
           (eNext.OutIdx >= 0) and (eNext.Curr.Y > eNext.Top.Y) and
-        SlopesEqual(E, eNext, FUse64BitRange) and
+        SlopesEqual(E.Curr, E.Top, eNext.Curr, eNext.Top, FUse64BitRange) and
         (E.WindDelta <> 0) and (eNext.WindDelta <> 0) then
       begin
         Op2 := AddOutPt(eNext, E.Bot);
@@ -3873,14 +4117,48 @@ begin
 end;
 //------------------------------------------------------------------------------
 
+procedure TClipper.FixupOutPolyline(OutRec: POutRec);
+var
+  PP, LastPP, TmpPP: POutPt;
+begin
+  //remove duplicate points ...
+  PP := OutRec.Pts;
+  LastPP := PP.Prev;
+  while (PP <> LastPP) do
+  begin
+    PP := PP.Next;
+    //strip duplicate points ...
+    if PointsEqual(PP.Pt, PP.Prev.Pt) then
+    begin
+      if PP = LastPP then LastPP := PP.Prev;
+      TmpPP := PP.Prev;
+      TmpPP.Next := PP.Next;
+      PP.Next.Prev := TmpPP;
+      dispose(PP);
+      PP := TmpPP;
+    end;
+  end;
+
+  if (PP = PP.Prev) then
+  begin
+    Dispose(PP);
+    OutRec.Pts := nil;
+    Exit;
+  end;
+
+end;
+//------------------------------------------------------------------------------
+
 procedure TClipper.FixupOutPolygon(OutRec: POutRec);
 var
   PP, Tmp, LastOK: POutPt;
+  PreserveCol: Boolean;
 begin
   //remove duplicate points and collinear edges
   LastOK := nil;
   OutRec.BottomPt := nil; //flag as stale
   PP := OutRec.Pts;
+  PreserveCol := FPreserveCollinear or FStrictSimple;
   while True do
   begin
     if (PP = PP.Prev) or (PP.Next = PP.Prev) then
@@ -3893,7 +4171,7 @@ begin
     //test for duplicate points and collinear edges ...
     if PointsEqual(PP.Pt, PP.Next.Pt) or PointsEqual(PP.Pt, PP.Prev.Pt) or
       (SlopesEqual(PP.Prev.Pt, PP.Pt, PP.Next.Pt, FUse64BitRange) and
-      (not FPreserveCollinear or
+      (not PreserveCol or
       not Pt2IsBetweenPt1AndPt3(PP.Prev.Pt, PP.Pt, PP.Next.Pt))) then
     begin
       //OK, we need to delete a point ...
@@ -3923,8 +4201,13 @@ end;
 //------------------------------------------------------------------------------
 
 function IntersectListSort(Node1, Node2: Pointer): Integer;
+var
+  i: cInt;
 begin
-  Result := Integer(PIntersectNode(Node2).Pt.Y - PIntersectNode(Node1).Pt.Y);
+  i := PIntersectNode(Node2).Pt.Y - PIntersectNode(Node1).Pt.Y;
+  if i < 0 then Result := -1
+  else if i > 0 then Result := 1
+  else Result := 0;
 end;
 //------------------------------------------------------------------------------
 
@@ -3941,7 +4224,21 @@ begin
   if Cnt < 2 then exit;
 
   CopyAELToSEL;
+  {$IFDEF USEGENERICS}
+  FIntersectList.Sort(TComparer<PIntersectNode>.Construct(
+    function (const Node1, Node2 : PIntersectNode) : integer
+    var
+      i: cInt;
+    begin
+      i := PIntersectNode(Node2).Pt.Y - PIntersectNode(Node1).Pt.Y;
+      if i < 0 then Result := -1
+      else if i > 0 then Result := 1
+      else Result := 0;
+    end
+    ));
+  {$ELSE}
   FIntersectList.Sort(IntersectListSort);
+  {$ENDIF}
   for I := 0 to Cnt - 1 do
   begin
     if not EdgesAdjacent(FIntersectList[I]) then
@@ -4086,7 +4383,7 @@ begin
   Op2 := Jr.OutPt2;
 
   //There are 3 kinds of joins for output polygons ...
-  //1. Horizontal joins where Join.OutPt1 & Join.OutPt2 are a vertices anywhere
+  //1. Horizontal joins where Join.OutPt1 & Join.OutPt2 are vertices anywhere
   //along (horizontal) collinear edges (& Join.OffPt is on the same horizontal).
   //2. Non-horizontal joins where Join.OutPt1 & Join.OutPt2 are at the same
   //location at the bottom of the overlapping segment (& Join.OffPt is above).
@@ -4098,6 +4395,9 @@ begin
   PointsEqual(Jr.OffPt, Jr.OutPt2.Pt) then
   begin
     //Strictly Simple join ...
+    if (OutRec1 <> OutRec2) then 
+      Exit;
+
     Op1b := Jr.OutPt1.Next;
     while (Op1b <> Op1) and
       PointsEqual(Op1b.Pt, Jr.OffPt) do Op1b := Op1b.Next;
@@ -4107,6 +4407,7 @@ begin
       PointsEqual(Op2b.Pt, Jr.OffPt) do Op2b := Op2b.Next;
     Reverse2 := (Op2b.Pt.Y > Jr.OffPt.Y);
     if (Reverse1 = Reverse2) then Exit;
+
     if Reverse1 then
     begin
       Op1b := DupOutPt(Op1, False);
@@ -4232,33 +4533,6 @@ begin
 end;
 //------------------------------------------------------------------------------
 
-procedure TClipper.FixupFirstLefts1(OldOutRec, NewOutRec: POutRec);
-var
-  I: Integer;
-  OutRec: POutRec;
-begin
-  for I := 0 to FPolyOutList.Count -1 do
-  begin
-    OutRec := fPolyOutList[I];
-    if Assigned(OutRec.Pts) and (OutRec.FirstLeft = OldOutRec) then
-    begin
-      if Poly2ContainsPoly1(OutRec.Pts, NewOutRec.Pts) then
-        OutRec.FirstLeft := NewOutRec;
-    end;
-  end;
-end;
-//------------------------------------------------------------------------------
-
-procedure TClipper.FixupFirstLefts2(OldOutRec, NewOutRec: POutRec);
-var
-  I: Integer;
-begin
-  for I := 0 to FPolyOutList.Count -1 do
-    with POutRec(fPolyOutList[I])^ do
-      if (FirstLeft = OldOutRec) then FirstLeft := NewOutRec;
-end;
-//------------------------------------------------------------------------------
-
 function ParseFirstLeft(FirstLeft: POutRec): POutRec;
 begin
   while Assigned(FirstLeft) and not Assigned(FirstLeft.Pts) do
@@ -4267,11 +4541,78 @@ begin
 end;
 //------------------------------------------------------------------------------
 
+procedure TClipper.FixupFirstLefts1(OldOutRec, NewOutRec: POutRec);
+var
+  I: Integer;
+  outRec: POutRec;
+  firstLeft: POutRec;
+begin
+  //tests if NewOutRec contains the polygon before reassigning FirstLeft
+  for I := 0 to FPolyOutList.Count -1 do
+  begin
+    outRec := fPolyOutList[I];
+    firstLeft := ParseFirstLeft(outRec.FirstLeft);
+    if Assigned(outRec.Pts) and (firstLeft = OldOutRec) then
+    begin
+      if Poly2ContainsPoly1(outRec.Pts, NewOutRec.Pts) then
+        outRec.FirstLeft := NewOutRec;
+    end;
+  end;
+end;
+//------------------------------------------------------------------------------
+
+procedure TClipper.FixupFirstLefts2(InnerOutRec, OuterOutRec: POutRec);
+var
+  I: Integer;
+  orfl, orec: POutRec;
+  firstLeft: POutRec;
+begin
+  //A polygon has split into two such that one is now the inner of the other.
+  //It's possible that these polygons now wrap around other polygons, so check
+  //every polygon that's also contained by OuterOutRec's FirstLeft container
+  //(including nil) to see if they've become inner to the new inner polygon ...
+  orfl := OuterOutRec.FirstLeft;
+  for I := 0 to FPolyOutList.Count -1 do
+  begin
+    orec := POutRec(fPolyOutList[I]);
+    if not Assigned(orec.Pts) or
+      (orec = OuterOutRec) or (orec = InnerOutRec) then continue;
+    firstLeft := ParseFirstLeft(orec.FirstLeft);
+    if (firstLeft <> orfl) and (firstLeft <> InnerOutRec) and
+      (firstLeft <> OuterOutRec) then Continue;
+    if Poly2ContainsPoly1(orec.Pts, InnerOutRec.Pts) then
+      orec.FirstLeft := InnerOutRec
+    else if Poly2ContainsPoly1(orec.Pts, OuterOutRec.Pts) then
+      orec.FirstLeft := OuterOutRec
+    else if (orec.FirstLeft = InnerOutRec) or
+      (orec.FirstLeft = OuterOutRec) then
+        orec.FirstLeft := orfl;
+  end;
+end;
+//------------------------------------------------------------------------------
+
+procedure TClipper.FixupFirstLefts3(OldOutRec, NewOutRec: POutRec);
+var
+  I: Integer;
+  outRec: POutRec;
+  firstLeft: POutRec;
+begin
+  //same as FixupFirstLefts1 but doesn't call Poly2ContainsPoly1()
+  for I := 0 to FPolyOutList.Count -1 do
+  begin
+    outRec := fPolyOutList[I];
+    firstLeft := ParseFirstLeft(outRec.FirstLeft);
+    if Assigned(outRec.Pts) and (firstLeft = OldOutRec) then
+       outRec.FirstLeft := NewOutRec;
+  end;
+end;
+//------------------------------------------------------------------------------
+
 procedure TClipper.JoinCommonEdges;
 var
-  I, J: Integer;
+  I: Integer;
   Jr: PJoin;
-  OutRec1, OutRec2, HoleStateRec, oRec: POutRec;
+  OutRec1, OutRec2, HoleStateRec: POutRec;
 begin
   for I := 0 to FJoinList.count -1 do
   begin
@@ -4286,8 +4627,8 @@ begin
     //get the polygon fragment with the correct hole state (FirstLeft)
     //before calling JoinPoints() ...
     if OutRec1 = OutRec2 then HoleStateRec := OutRec1
-    else if Param1RightOfParam2(OutRec1, OutRec2) then HoleStateRec := OutRec2
-    else if Param1RightOfParam2(OutRec2, OutRec1) then HoleStateRec := OutRec1
+    else if OutRec1RightOfOutRec2(OutRec1, OutRec2) then HoleStateRec := OutRec2
+    else if OutRec1RightOfOutRec2(OutRec2, OutRec1) then HoleStateRec := OutRec1
     else HoleStateRec := GetLowermostRec(OutRec1, OutRec2);
 
     if not JoinPoints(Jr, OutRec1, OutRec2) then Continue;
@@ -4304,41 +4645,27 @@ begin
       //update all OutRec2.Pts idx's ...
       UpdateOutPtIdxs(OutRec2);
 
-      //We now need to check every OutRec.FirstLeft pointer. If it points
-      //to OutRec1 it may need to point to OutRec2 instead ...
-      if FUsingPolyTree then
-        for J := 0 to FPolyOutList.Count - 2 do
-        begin
-          oRec := POutRec(FPolyOutList[J]);
-          if not Assigned(oRec.Pts) or
-            (ParseFirstLeft(oRec.FirstLeft) <> OutRec1) or
-            (oRec.IsHole = OutRec1.IsHole) then Continue;
-          if Poly2ContainsPoly1(oRec.Pts, Jr.OutPt2) then
-              oRec.FirstLeft := OutRec2;
-        end;
-
       //sort out the hole states of both polygon ...
       if Poly2ContainsPoly1(OutRec2.Pts, OutRec1.Pts) then
       begin
-        //OutRec2 is contained by OutRec1 ...
+        //OutRec1 contains OutRec2 ...
         OutRec2.IsHole := not OutRec1.IsHole;
         OutRec2.FirstLeft := OutRec1;
 
-        //fixup FirstLeft pointers that may need reassigning to OutRec1
-        if FUsingPolyTree then FixupFirstLefts2(OutRec2, OutRec1);
+        if FUsingPolyTree then
+          FixupFirstLefts2(OutRec2, OutRec1);
 
         if (OutRec2.IsHole xor FReverseOutput) = (Area(OutRec2) > 0) then
             ReversePolyPtLinks(OutRec2.Pts);
       end else if Poly2ContainsPoly1(OutRec1.Pts, OutRec2.Pts) then
       begin
-        //OutRec1 is contained by OutRec2 ...
+        //OutRec2 contains OutRec1 ...
         OutRec2.IsHole := OutRec1.IsHole;
         OutRec1.IsHole := not OutRec2.IsHole;
         OutRec2.FirstLeft := OutRec1.FirstLeft;
         OutRec1.FirstLeft := OutRec2;
-
-        //fixup FirstLeft pointers that may need reassigning to OutRec1
-        if FUsingPolyTree then FixupFirstLefts2(OutRec1, OutRec2);
+        if FUsingPolyTree then
+          FixupFirstLefts2(OutRec1, OutRec2);
 
         if (OutRec1.IsHole xor FReverseOutput) = (Area(OutRec1) > 0) then
           ReversePolyPtLinks(OutRec1.Pts);
@@ -4365,8 +4692,8 @@ begin
         OutRec1.FirstLeft := OutRec2.FirstLeft;
       OutRec2.FirstLeft := OutRec1;
 
-      //fixup FirstLeft pointers that may need reassigning to OutRec1
-      if FUsingPolyTree then FixupFirstLefts2(OutRec2, OutRec1);
+      if FUsingPolyTree then
+        FixupFirstLefts3(OutRec2, OutRec1);
     end;
   end;
 end;
@@ -4384,13 +4711,13 @@ begin
     OutRec1 := POutRec(fPolyOutList[I]);
     inc(I);
     Op := OutRec1.Pts;
-    if not assigned(OP) then Continue;
+    if not assigned(Op) or OutRec1.IsOpen then Continue;
     repeat //for each Pt in Path until duplicate found do ...
       Op2 := Op.Next;
       while (Op2 <> OutRec1.Pts) do
       begin
         if (PointsEqual(Op.Pt, Op2.Pt) and
-          (Op2.Next <> Op)and (Op2.Prev <> Op)) then
+          (Op2.Next <> Op) and (Op2.Prev <> Op)) then
         begin
           //split the polygon into two ...
           Op3 := Op.Prev;
@@ -4405,12 +4732,12 @@ begin
           OutRec2 := CreateOutRec;
           OutRec2.Pts := Op2;
           UpdateOutPtIdxs(OutRec2);
-
           if Poly2ContainsPoly1(OutRec2.Pts, OutRec1.Pts) then
           begin
             //OutRec2 is contained by OutRec1 ...
             OutRec2.IsHole := not OutRec1.IsHole;
             OutRec2.FirstLeft := OutRec1;
+            if FUsingPolyTree then FixupFirstLefts2(OutRec2, OutRec1);
           end
           else
           if Poly2ContainsPoly1(OutRec1.Pts, OutRec2.Pts) then
@@ -4420,11 +4747,13 @@ begin
             OutRec1.IsHole := not OutRec2.IsHole;
             OutRec2.FirstLeft := OutRec1.FirstLeft;
             OutRec1.FirstLeft := OutRec2;
+            if FUsingPolyTree then FixupFirstLefts2(OutRec1, OutRec2);
           end else
           begin
             //the 2 polygons are separate ...
             OutRec2.IsHole := OutRec1.IsHole;
             OutRec2.FirstLeft := OutRec1.FirstLeft;
+            if FUsingPolyTree then FixupFirstLefts1(OutRec1, OutRec2);
           end;
           Op2 := Op; //ie get ready for the next iteration
         end;
@@ -4434,36 +4763,16 @@ begin
     until (Op = OutRec1.Pts);
   end;
 end;
-//------------------------------------------------------------------------------
-
-function GetUnitNormal(const Pt1, Pt2: TIntPoint): TDoublePoint;
-var
-  Dx, Dy, F: Single;
-begin
-  if (Pt2.X = Pt1.X) and (Pt2.Y = Pt1.Y) then
-  begin
-    Result.X := 0;
-    Result.Y := 0;
-    Exit;
-  end;
-
-  Dx := (Pt2.X - Pt1.X);
-  Dy := (Pt2.Y - Pt1.Y);
-  F := 1 / Hypot(Dx, Dy);
-  Dx := Dx * F;
-  Dy := Dy * F;
-  Result.X := Dy;
-  Result.Y := -Dx
-end;
 
 //------------------------------------------------------------------------------
-// TClipperOffset
+// TClipperOffset methods
 //------------------------------------------------------------------------------
 
 constructor TClipperOffset.Create(
   MiterLimit: Double = 2;
   ArcTolerance: Double = def_arc_tolerance);
 begin
+  inherited Create;
   FPolyNodes := TPolyNode.Create;
   FLowest.X := -1;
   FMiterLimit := MiterLimit;
@@ -4475,15 +4784,20 @@ destructor TClipperOffset.Destroy;
 begin
   Clear;
   FPolyNodes.Free;
+  inherited;
 end;
 //------------------------------------------------------------------------------
 
 procedure TClipperOffset.Clear;
 var
   I: Integer;
+  PolyNode: TPolyNode;
 begin
   for I := 0 to FPolyNodes.ChildCount -1 do
-    FPolyNodes.Childs[I].Free;
+    begin
+      PolyNode:= FPolyNodes.Childs[I];
+      PolyNode.Free;
+    end;
   FPolyNodes.FCount := 0;
   FPolyNodes.FBuffLen := 16;
   SetLength(FPolyNodes.FChilds, 16);
@@ -4523,8 +4837,7 @@ begin
   inc(J);
   if J < HighI +1 then
     SetLength(NewNode.FPath, J);
-  if ((EndType = etClosedPolygon) and (J < 3)) or
-    ((EndType <> etClosedPolygon) and (J < 1)) then
+  if (EndType = etClosedPolygon) and (J < 3) then
   begin
     NewNode.free;
     Exit;
@@ -4535,7 +4848,7 @@ begin
   //if this path's lowest pt is lower than all the others then update FLowest
   if (FLowest.X < 0) then
   begin
-    FLowest := IntPoint(0, K);
+    FLowest := IntPoint(FPolyNodes.ChildCount -1, K);
   end else
   begin
     ip := FPolyNodes.Childs[FLowest.X].FPath[FLowest.Y];
@@ -4858,6 +5171,7 @@ begin
         OuterNode := solution.Childs[0];
         SetLength(solution.FChilds, OuterNode.ChildCount);
         solution.FChilds[0] := OuterNode.Childs[0];
+        solution.FChilds[0].FParent := solution;
         for I := 1 to OuterNode.ChildCount -1 do
           solution.AddChild(OuterNode.Childs[I]);
       end else
@@ -4881,18 +5195,13 @@ end;
 //------------------------------------------------------------------------------
 
 procedure TClipperOffset.DoSquare(J, K: Integer);
-var
-  A, Dx: Double;
 begin
-  //see offset_triginometry.svg in the documentation folder ...
-  A := ArcTan2(FSinA, FNorms[K].X * FNorms[J].X + FNorms[K].Y * FNorms[J].Y);
-  Dx := tan(A/4);
   AddPoint(IntPoint(
-    round(FInP[J].X + FDelta * (FNorms[K].X - FNorms[K].Y *Dx)),
-    round(FInP[J].Y + FDelta * (FNorms[K].Y + FNorms[K].X *Dx))));
+    round(FInP[J].X + FDelta * (FNorms[K].X - FNorms[K].Y)),
+    round(FInP[J].Y + FDelta * (FNorms[K].Y + FNorms[K].X))));
   AddPoint(IntPoint(
-    round(FInP[J].X + FDelta * (FNorms[J].X + FNorms[J].Y *Dx)),
-    round(FInP[J].Y + FDelta * (FNorms[J].Y - FNorms[J].X *Dx))));
+    round(FInP[J].X + FDelta * (FNorms[J].X + FNorms[J].Y)),
+    round(FInP[J].Y + FDelta * (FNorms[J].Y - FNorms[J].X))));
 end;
 //------------------------------------------------------------------------------
 
@@ -4912,7 +5221,7 @@ var
   A, X, X2, Y: Double;
 begin
   A := ArcTan2(FSinA, FNorms[K].X * FNorms[J].X + FNorms[K].Y * FNorms[J].Y);
-  Steps := Round(FStepsPerRad * Abs(A));
+  Steps := Max(Round(FStepsPerRad * Abs(A)), 1);
 
   X := FNorms[K].X;
   Y := FNorms[K].Y;
@@ -4934,10 +5243,25 @@ end;
 procedure TClipperOffset.OffsetPoint(J: Integer;
   var K: Integer; JoinType: TJoinType);
 var
-  R: Double;
+  R, cosA: Double;
 begin
+  //cross product ...
   FSinA := (FNorms[K].X * FNorms[J].Y - FNorms[J].X * FNorms[K].Y);
-  if (FSinA < 0.00005) and (FSinA > -0.00005) then Exit
+  if (Abs(FSinA * FDelta) < 1.0) then
+  begin
+    //very nearly collinear edges can occasionally cause tiny self-intersections
+    //due to rounding so offset with a single vertex here. (nb: The two offset
+    //vertices that would otherwise have been used would be < 1 unit apart.)
+    //dot product ...
+    cosA := (FNorms[K].X * FNorms[J].X + FNorms[J].Y * FNorms[K].Y );
+    if (cosA > 0) then // angle => 0 deg.
+    begin
+      AddPoint(IntPoint(round(FInP[J].X + FNorms[K].X * FDelta),
+        round(FInP[J].Y + FNorms[K].Y * FDelta)));
+      Exit;
+    end
+    //else angle => 180 deg.
+  end
   else if (FSinA > 1.0) then FSinA := 1.0
   else if (FSinA < -1.0) then FSinA := -1.0;
 
@@ -4990,7 +5314,8 @@ begin
 end;
 //------------------------------------------------------------------------------
 
-function DistanceSqrd(const Pt1, Pt2: TIntPoint): Double; {$IFDEF INLINING} inline; {$ENDIF}
+function DistanceSqrd(const Pt1, Pt2: TIntPoint): Double;
+{$IFDEF INLINING} inline; {$ENDIF}
 var
   dx, dy: Double;
 begin
@@ -5021,7 +5346,26 @@ end;
 function SlopesNearCollinear(const Pt1, Pt2, Pt3: TIntPoint;
   DistSqrd: Double): Boolean;
 begin
-  result := DistanceFromLineSqrd(Pt2, Pt1, Pt3) < DistSqrd;
+  //this function is more accurate when the point that's geometrically
+  //between the other 2 points is the one that's tested for distance.
+  //ie makes it more likely to pick up 'spikes' ...
+  if Abs(Pt1.X - Pt2.X) > Abs(Pt1.Y - Pt2.Y) then
+  begin
+    if (Pt1.X > Pt2.X) = (Pt1.X < Pt3.X) then
+      result := DistanceFromLineSqrd(Pt1, Pt2, Pt3) < DistSqrd
+    else if (Pt2.X > Pt1.X) = (Pt2.X < Pt3.X) then
+      result := DistanceFromLineSqrd(Pt2, Pt1, Pt3) < DistSqrd
+    else
+      result := DistanceFromLineSqrd(Pt3, Pt1, Pt2) < DistSqrd;
+  end else
+  begin
+    if (Pt1.Y > Pt2.Y) = (Pt1.Y < Pt3.Y) then
+      result := DistanceFromLineSqrd(Pt1, Pt2, Pt3) < DistSqrd
+    else if (Pt2.Y > Pt1.Y) = (Pt2.Y < Pt3.Y) then
+      result := DistanceFromLineSqrd(Pt2, Pt1, Pt3) < DistSqrd
+    else
+      result := DistanceFromLineSqrd(Pt3, Pt1, Pt2) < DistSqrd;
+  end;
 end;
 //------------------------------------------------------------------------------
 
@@ -5116,56 +5460,62 @@ function Minkowski(const Base, Path: TPath;
   IsSum: Boolean; IsClosed: Boolean): TPaths;
 var
   i, j, delta, baseLen, pathLen: integer;
-  quads: TPaths;
   quad: TPath;
+  tmp: TPaths;
 begin
   if IsClosed then delta := 1 else delta := 0;
 
   baseLen := Length(Base);
   pathLen := Length(Path);
-  setLength(Result, pathLen);
+  setLength(tmp, pathLen);
   if IsSum then
     for i := 0 to pathLen -1 do
     begin
-      setLength(Result[i], baseLen);
+      setLength(tmp[i], baseLen);
       for j := 0 to baseLen -1 do
       begin
-        Result[i][j].X := Path[i].X + Base[j].X;
-        Result[i][j].Y := Path[i].Y + Base[j].Y;
+        tmp[i][j].X := Path[i].X + Base[j].X;
+        tmp[i][j].Y := Path[i].Y + Base[j].Y;
       end;
     end
   else
     for i := 0 to pathLen -1 do
     begin
-      setLength(Result[i], baseLen);
+      setLength(tmp[i], baseLen);
       for j := 0 to baseLen -1 do
       begin
-        Result[i][j].X := Path[i].X - Base[j].X;
-        Result[i][j].Y := Path[i].Y - Base[j].Y;
+        tmp[i][j].X := Path[i].X - Base[j].X;
+        tmp[i][j].Y := Path[i].Y - Base[j].Y;
       end;
     end;
 
   SetLength(quad, 4);
-  SetLength(quads, (pathLen + delta) * (baseLen + 1));
+  SetLength(Result, (pathLen + delta) * (baseLen + 1));
   for i := 0 to pathLen - 2 + delta do
   begin
-    for j := 1 to baseLen - 1 do
+    for j := 0 to baseLen - 1 do
     begin
-      quad[0] := Result[i mod pathLen][j mod baseLen];
-      quad[1] := Result[(i+1) mod pathLen][j mod baseLen];
-      quad[2] := Result[(i+1) mod pathLen][(j+1) mod baseLen];
-      quad[3] := Result[i mod pathLen][(j+1) mod baseLen];
+      quad[0] := tmp[i mod pathLen][j mod baseLen];
+      quad[1] := tmp[(i+1) mod pathLen][j mod baseLen];
+      quad[2] := tmp[(i+1) mod pathLen][(j+1) mod baseLen];
+      quad[3] := tmp[i mod pathLen][(j+1) mod baseLen];
       if not Orientation(quad) then quad := ReversePath(quad);
-      quads[i*baseLen + j] := copy(quad, 0, 4);
+      Result[i*baseLen + j] := copy(quad, 0, 4);
     end;
   end;
+end;
+//------------------------------------------------------------------------------
 
-  with TClipper.Create() do
-  try
-    AddPaths(quads, ptSubject, True);
-    Execute(ctUnion, Result, pftNonZero);
-  finally
-    Free;
+function TranslatePath(const Path: TPath; const Delta: TIntPoint): TPath;
+var
+  i, len: Integer;
+begin
+  len := Length(Path);
+  SetLength(Result, len);
+  for i := 0 to High(Path) do
+  begin
+    Result[i].X := Path[i].X + Delta.X;
+    Result[i].Y := Path[i].Y + Delta.Y;
   end;
 end;
 //------------------------------------------------------------------------------
@@ -5173,6 +5523,13 @@ end;
 function MinkowskiSum(const Pattern, Path: TPath; PathIsClosed: Boolean): TPaths;
 begin
   Result := Minkowski(Pattern, Path, true, PathIsClosed);
+  with TClipper.Create() do
+  try
+    AddPaths(Result, ptSubject, True);
+    Execute(ctUnion, Result, pftNonZero);
+  finally
+    Free;
+  end;
 end;
 //------------------------------------------------------------------------------
 
@@ -5180,14 +5537,24 @@ function MinkowskiSum(const Pattern: TPath; const Paths: TPaths;
   PathFillType: TPolyFillType; PathIsClosed: Boolean): TPaths;
 var
   I, Cnt: Integer;
+  Paths2: TPaths;
+  Path: TPath;
 begin
+  Result := nil;
+  if Length(Pattern) = 0 then Exit;
   Cnt := Length(Paths);
   with TClipper.Create() do
   try
     for I := 0 to Cnt -1 do
-      AddPaths( Minkowski(Pattern, Paths[I], true, PathIsClosed),
-        ptSubject, true);
-      if PathIsClosed then AddPaths(Paths, ptClip, true);
+    begin
+      Paths2 := Minkowski(Pattern, Paths[I], true, PathIsClosed);
+      AddPaths( Paths2, ptSubject, true);
+      if PathIsClosed then
+      begin
+        Path := TranslatePath(Paths[I], Pattern[0]);
+        AddPath(Path, ptClip, true);
+      end;
+    end;
     Execute(ctUnion, Result, PathFillType, PathFillType);
   finally
     Free;
@@ -5198,13 +5565,20 @@ end;
 function MinkowskiDiff(const Poly1, Poly2: TPath): TPaths;
 begin
   Result := Minkowski(Poly1, Poly2, false, true);
+  with TClipper.Create() do
+  try
+    AddPaths(Result, ptSubject, True);
+    Execute(ctUnion, Result, pftNonZero);
+  finally
+    Free;
+  end;
 end;
 //------------------------------------------------------------------------------
 
 type
   TNodeType = (ntAny, ntOpen, ntClosed);
 
-procedure AddPolyNodeToPolygons(PolyNode: TPolyNode;
+procedure AddPolyNodeToPaths(PolyNode: TPolyNode;
   NodeType: TNodeType; var Paths: TPaths);
 var
   I: Integer;
@@ -5223,21 +5597,21 @@ begin
     Paths[I] := PolyNode.Contour;
   end;
   for I := 0 to PolyNode.ChildCount - 1 do
-    AddPolyNodeToPolygons(PolyNode.Childs[I], NodeType, Paths);
+    AddPolyNodeToPaths(PolyNode.Childs[I], NodeType, Paths);
 end;
 //------------------------------------------------------------------------------
 
 function PolyTreeToPaths(PolyTree: TPolyTree): TPaths;
 begin
   Result := nil;
-  AddPolyNodeToPolygons(PolyTree, ntAny, Result);
+  AddPolyNodeToPaths(PolyTree, ntAny, Result);
 end;
 //------------------------------------------------------------------------------
 
 function ClosedPathsFromPolyTree(PolyTree: TPolyTree): TPaths;
 begin
   Result := nil;
-  AddPolyNodeToPolygons(PolyTree, ntClosed, Result);
+  AddPolyNodeToPaths(PolyTree, ntClosed, Result);
 end;
 //------------------------------------------------------------------------------
 
@@ -5258,22 +5632,5 @@ end;
 
 //------------------------------------------------------------------------------
 //------------------------------------------------------------------------------
-
-{$IFDEF use_deprecated}
-function OffsetPaths(const Polys: TPaths; const Delta: Double;
-  JoinType: TJoinType = jtSquare; EndType: TEndType_ = etClosed;
-  Limit: Double = 0): TPaths;
-begin
-  with TClipperOffset.Create(Limit, Limit) do
-  try
-    AddPaths(Polys, JoinType, TEndType(EndType));
-    Execute(Result, Delta);
-  finally
-    Free;
-  end;
-end;
-//------------------------------------------------------------------------------
-{$ENDIF}
-
 
 end.
